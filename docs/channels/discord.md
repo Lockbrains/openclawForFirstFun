@@ -57,7 +57,7 @@ DISCORD_BOT_TOKEN=...
     Invite the bot to your server with message permissions.
 
 ```bash
-openclaw gateway
+firstclaw gateway
 ```
 
   </Step>
@@ -65,8 +65,8 @@ openclaw gateway
   <Step title="Approve first DM pairing">
 
 ```bash
-openclaw pairing list discord
-openclaw pairing approve discord <CODE>
+firstclaw pairing list discord
+firstclaw pairing approve discord <CODE>
 ```
 
     Pairing codes expire after 1 hour.
@@ -215,7 +215,7 @@ Token resolution is account-aware. Config token values win over env fallback. `D
     - channel ID
     - user ID
 
-    Prefer numeric IDs in OpenClaw config for reliable audits and probes.
+    Prefer numeric IDs in FirstClaw config for reliable audits and probes.
 
   </Accordion>
 </AccordionGroup>
@@ -226,7 +226,7 @@ Token resolution is account-aware. Config token values win over env fallback. `D
 - Per-channel override: `channels.discord.commands.native`.
 - `commands.native=false` explicitly clears previously registered Discord native commands.
 - Native command auth uses the same Discord allowlists/policies as normal message handling.
-- Commands may still be visible in Discord UI for users who are not authorized; execution still enforces OpenClaw auth and returns "not authorized".
+- Commands may still be visible in Discord UI for users who are not authorized; execution still enforces FirstClaw auth and returns "not authorized".
 
 See [Slash commands](/tools/slash-commands) for command catalog and behavior.
 
@@ -386,9 +386,9 @@ Default gate behavior:
     Useful checks:
 
 ```bash
-openclaw doctor
-openclaw channels status --probe
-openclaw logs --follow
+firstclaw doctor
+firstclaw channels status --probe
+firstclaw logs --follow
 ```
 
   </Accordion>
@@ -446,7 +446,7 @@ High-signal Discord fields:
 
 - Treat bot tokens as secrets (`DISCORD_BOT_TOKEN` preferred in supervised environments).
 - Grant least-privilege Discord permissions.
-- If command deploy/state is stale, restart gateway and re-check with `openclaw channels status --probe`.
+- If command deploy/state is stale, restart gateway and re-check with `firstclaw channels status --probe`.
 
 ## Related
 

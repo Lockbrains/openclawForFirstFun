@@ -1,7 +1,7 @@
 ---
 read_when:
   - 你希望以最快的方式从安装到运行一个可用的 Gateway 网关
-summary: 安装 OpenClaw，完成 Gateway 网关新手引导，并配对你的第一个渠道。
+summary: 安装 FirstClaw，完成 Gateway 网关新手引导，并配对你的第一个渠道。
 title: 快速开始
 x-i18n:
   generated_at: "2026-02-04T17:53:21Z"
@@ -13,7 +13,7 @@ x-i18n:
 ---
 
 <Note>
-OpenClaw 需要 Node 22 或更新版本。
+FirstClaw 需要 Node 22 或更新版本。
 </Note>
 
 ## 安装
@@ -21,12 +21,12 @@ OpenClaw 需要 Node 22 或更新版本。
 <Tabs>
   <Tab title="npm">
     ```bash
-    npm install -g openclaw@latest
+    npm install -g firstclaw@latest
     ```
   </Tab>
   <Tab title="pnpm">
     ```bash
-    pnpm add -g openclaw@latest
+    pnpm add -g firstclaw@latest
     ```
   </Tab>
 </Tabs>
@@ -36,47 +36,47 @@ OpenClaw 需要 Node 22 或更新版本。
 <Steps>
   <Step title="新手引导并安装服务">
     ```bash
-    openclaw onboard --install-daemon
+    firstclaw onboard --install-daemon
     ```
   </Step>
   <Step title="配对 WhatsApp">
     ```bash
-    openclaw channels login
+    firstclaw channels login
     ```
   </Step>
   <Step title="启动 Gateway 网关">
     ```bash
-    openclaw gateway --port 18789
+    firstclaw gateway --port 18789
     ```
   </Step>
 </Steps>
 
-完成新手引导后，Gateway 网关将通过用户服务运行。你也可以使用 `openclaw gateway` 手动启动。
+完成新手引导后，Gateway 网关将通过用户服务运行。你也可以使用 `firstclaw gateway` 手动启动。
 
 <Info>
 之后在 npm 安装和 git 安装之间切换非常简单。安装另一种方式后，运行
-`openclaw doctor` 即可更新 Gateway 网关服务入口点。
+`firstclaw doctor` 即可更新 Gateway 网关服务入口点。
 </Info>
 
 ## 从源码安装（开发）
 
 ```bash
-git clone https://github.com/openclaw/openclaw.git
-cd openclaw
+git clone https://github.com/firstclaw/firstclaw.git
+cd firstclaw
 pnpm install
 pnpm ui:build # 首次运行时会自动安装 UI 依赖
 pnpm build
-openclaw onboard --install-daemon
+firstclaw onboard --install-daemon
 ```
 
-如果你还没有全局安装，可以在仓库目录中通过 `pnpm openclaw ...` 运行新手引导。
+如果你还没有全局安装，可以在仓库目录中通过 `pnpm firstclaw ...` 运行新手引导。
 
 ## 多实例快速开始（可选）
 
 ```bash
-OPENCLAW_CONFIG_PATH=~/.openclaw/a.json \
-OPENCLAW_STATE_DIR=~/.openclaw-a \
-openclaw gateway --port 19001
+FIRSTCLAW_CONFIG_PATH=~/.firstclaw/a.json \
+FIRSTCLAW_STATE_DIR=~/.firstclaw-a \
+firstclaw gateway --port 19001
 ```
 
 ## 发送测试消息
@@ -84,5 +84,5 @@ openclaw gateway --port 19001
 需要一个正在运行的 Gateway 网关。
 
 ```bash
-openclaw message send --target +15555550123 --message "Hello from OpenClaw"
+firstclaw message send --target +15555550123 --message "Hello from FirstClaw"
 ```

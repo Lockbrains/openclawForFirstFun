@@ -13,14 +13,12 @@ import {
 import { setCommandLaneConcurrency } from "../process/command-queue.js";
 import { CommandLane } from "../process/lanes.js";
 import { resolveHooksConfig } from "./hooks.js";
-import { startBrowserControlServerIfEnabled } from "./server-browser.js";
 import { buildGatewayCronService, type GatewayCronState } from "./server-cron.js";
 
 type GatewayHotReloadState = {
   hooksConfig: ReturnType<typeof resolveHooksConfig>;
   heartbeatRunner: HeartbeatRunner;
   cronState: GatewayCronState;
-  browserControl: Awaited<ReturnType<typeof startBrowserControlServerIfEnabled>> | null;
 };
 
 export function createGatewayReloadHandlers(params: {
@@ -35,7 +33,6 @@ export function createGatewayReloadHandlers(params: {
     warn: (msg: string) => void;
     error: (msg: string) => void;
   };
-  logBrowser: { error: (msg: string) => void };
   logChannels: { info: (msg: string) => void; error: (msg: string) => void };
   logCron: { error: (msg: string) => void };
   logReload: { info: (msg: string) => void; warn: (msg: string) => void };
@@ -74,20 +71,9 @@ export function createGatewayReloadHandlers(params: {
         .catch((err) => params.logCron.error(`failed to start: ${String(err)}`));
     }
 
-    if (plan.restartBrowserControl) {
-      if (state.browserControl) {
-        await state.browserControl.stop().catch(() => {});
-      }
-      try {
-        nextState.browserControl = await startBrowserControlServerIfEnabled();
-      } catch (err) {
-        params.logBrowser.error(`server failed to start: ${String(err)}`);
-      }
-    }
-
     if (plan.restartGmailWatcher) {
       await stopGmailWatcher().catch(() => {});
-      if (!isTruthyEnvValue(process.env.OPENCLAW_SKIP_GMAIL_WATCHER)) {
+      if (!isTruthyEnvValue(process.env.FIRSTCLAW_SKIP_GMAIL_WATCHER)) {
         try {
           const gmailResult = await startGmailWatcher(nextConfig);
           if (gmailResult.started) {
@@ -103,17 +89,17 @@ export function createGatewayReloadHandlers(params: {
           params.logHooks.error(`gmail watcher failed to start: ${String(err)}`);
         }
       } else {
-        params.logHooks.info("skipping gmail watcher restart (OPENCLAW_SKIP_GMAIL_WATCHER=1)");
+        params.logHooks.info("skipping gmail watcher restart (FIRSTCLAW_SKIP_GMAIL_WATCHER=1)");
       }
     }
 
     if (plan.restartChannels.size > 0) {
       if (
-        isTruthyEnvValue(process.env.OPENCLAW_SKIP_CHANNELS) ||
-        isTruthyEnvValue(process.env.OPENCLAW_SKIP_PROVIDERS)
+        isTruthyEnvValue(process.env.FIRSTCLAW_SKIP_CHANNELS) ||
+        isTruthyEnvValue(process.env.FIRSTCLAW_SKIP_PROVIDERS)
       ) {
         params.logChannels.info(
-          "skipping channel reload (OPENCLAW_SKIP_CHANNELS=1 or OPENCLAW_SKIP_PROVIDERS=1)",
+          "skipping channel reload (FIRSTCLAW_SKIP_CHANNELS=1 or FIRSTCLAW_SKIP_PROVIDERS=1)",
         );
       } else {
         const restartChannel = async (name: ChannelKind) => {

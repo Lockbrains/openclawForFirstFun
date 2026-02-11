@@ -33,33 +33,6 @@ describe("legacy config detection", () => {
       expect(res.config.channels?.imessage?.groupPolicy).toBe("allowlist");
     }
   });
-  it("defaults discord.groupPolicy to allowlist when discord section exists", async () => {
-    vi.resetModules();
-    const { validateConfigObject } = await import("./config.js");
-    const res = validateConfigObject({ channels: { discord: {} } });
-    expect(res.ok).toBe(true);
-    if (res.ok) {
-      expect(res.config.channels?.discord?.groupPolicy).toBe("allowlist");
-    }
-  });
-  it("defaults slack.groupPolicy to allowlist when slack section exists", async () => {
-    vi.resetModules();
-    const { validateConfigObject } = await import("./config.js");
-    const res = validateConfigObject({ channels: { slack: {} } });
-    expect(res.ok).toBe(true);
-    if (res.ok) {
-      expect(res.config.channels?.slack?.groupPolicy).toBe("allowlist");
-    }
-  });
-  it("defaults msteams.groupPolicy to allowlist when msteams section exists", async () => {
-    vi.resetModules();
-    const { validateConfigObject } = await import("./config.js");
-    const res = validateConfigObject({ channels: { msteams: {} } });
-    expect(res.ok).toBe(true);
-    if (res.ok) {
-      expect(res.config.channels?.msteams?.groupPolicy).toBe("allowlist");
-    }
-  });
   it("rejects unsafe executable config values", async () => {
     vi.resetModules();
     const { validateConfigObject } = await import("./config.js");
@@ -93,28 +66,6 @@ describe("legacy config detection", () => {
     });
     expect(res.ok).toBe(true);
   });
-  it('rejects discord.dm.policy="open" without allowFrom "*"', async () => {
-    vi.resetModules();
-    const { validateConfigObject } = await import("./config.js");
-    const res = validateConfigObject({
-      channels: { discord: { dm: { policy: "open", allowFrom: ["123"] } } },
-    });
-    expect(res.ok).toBe(false);
-    if (!res.ok) {
-      expect(res.issues[0]?.path).toBe("channels.discord.dm.allowFrom");
-    }
-  });
-  it('rejects slack.dm.policy="open" without allowFrom "*"', async () => {
-    vi.resetModules();
-    const { validateConfigObject } = await import("./config.js");
-    const res = validateConfigObject({
-      channels: { slack: { dm: { policy: "open", allowFrom: ["U123"] } } },
-    });
-    expect(res.ok).toBe(false);
-    if (!res.ok) {
-      expect(res.issues[0]?.path).toBe("channels.slack.dm.allowFrom");
-    }
-  });
   it("rejects legacy agent.model string", async () => {
     vi.resetModules();
     const { validateConfigObject } = await import("./config.js");
@@ -125,18 +76,6 @@ describe("legacy config detection", () => {
     if (!res.ok) {
       expect(res.issues.some((i) => i.path === "agent.model")).toBe(true);
     }
-  });
-  it("migrates telegram.requireMention to channels.telegram.groups.*.requireMention", async () => {
-    vi.resetModules();
-    const { migrateLegacyConfig } = await import("./config.js");
-    const res = migrateLegacyConfig({
-      telegram: { requireMention: false },
-    });
-    expect(res.changes).toContain(
-      'Moved telegram.requireMention → channels.telegram.groups."*".requireMention.',
-    );
-    expect(res.config?.channels?.telegram?.groups?.["*"]?.requireMention).toBe(false);
-    expect(res.config?.channels?.telegram?.requireMention).toBeUndefined();
   });
   it("migrates messages.tts.enabled to messages.tts.auto", async () => {
     vi.resetModules();
@@ -176,7 +115,7 @@ describe("legacy config detection", () => {
   });
   it("flags legacy config in snapshot", async () => {
     await withTempHome(async (home) => {
-      const configPath = path.join(home, ".openclaw", "openclaw.json");
+      const configPath = path.join(home, ".firstclaw", "firstclaw.json");
       await fs.mkdir(path.dirname(configPath), { recursive: true });
       await fs.writeFile(
         configPath,
@@ -202,7 +141,7 @@ describe("legacy config detection", () => {
   });
   it("flags top-level memorySearch as legacy in snapshot", async () => {
     await withTempHome(async (home) => {
-      const configPath = path.join(home, ".openclaw", "openclaw.json");
+      const configPath = path.join(home, ".firstclaw", "firstclaw.json");
       await fs.mkdir(path.dirname(configPath), { recursive: true });
       await fs.writeFile(
         configPath,
@@ -220,7 +159,7 @@ describe("legacy config detection", () => {
   });
   it("does not auto-migrate claude-cli auth profile mode on load", async () => {
     await withTempHome(async (home) => {
-      const configPath = path.join(home, ".openclaw", "openclaw.json");
+      const configPath = path.join(home, ".firstclaw", "firstclaw.json");
       await fs.mkdir(path.dirname(configPath), { recursive: true });
       await fs.writeFile(
         configPath,
@@ -252,7 +191,7 @@ describe("legacy config detection", () => {
   });
   it("flags legacy provider sections in snapshot", async () => {
     await withTempHome(async (home) => {
-      const configPath = path.join(home, ".openclaw", "openclaw.json");
+      const configPath = path.join(home, ".firstclaw", "firstclaw.json");
       await fs.mkdir(path.dirname(configPath), { recursive: true });
       await fs.writeFile(
         configPath,
@@ -278,7 +217,7 @@ describe("legacy config detection", () => {
   });
   it("flags routing.allowFrom in snapshot", async () => {
     await withTempHome(async (home) => {
-      const configPath = path.join(home, ".openclaw", "openclaw.json");
+      const configPath = path.join(home, ".firstclaw", "firstclaw.json");
       await fs.mkdir(path.dirname(configPath), { recursive: true });
       await fs.writeFile(
         configPath,
@@ -304,7 +243,7 @@ describe("legacy config detection", () => {
   });
   it("rejects bindings[].match.provider on load", async () => {
     await withTempHome(async (home) => {
-      const configPath = path.join(home, ".openclaw", "openclaw.json");
+      const configPath = path.join(home, ".firstclaw", "firstclaw.json");
       await fs.mkdir(path.dirname(configPath), { recursive: true });
       await fs.writeFile(
         configPath,
@@ -334,7 +273,7 @@ describe("legacy config detection", () => {
   });
   it("rejects bindings[].match.accountID on load", async () => {
     await withTempHome(async (home) => {
-      const configPath = path.join(home, ".openclaw", "openclaw.json");
+      const configPath = path.join(home, ".firstclaw", "firstclaw.json");
       await fs.mkdir(path.dirname(configPath), { recursive: true });
       await fs.writeFile(
         configPath,
@@ -364,7 +303,7 @@ describe("legacy config detection", () => {
   });
   it("rejects session.sendPolicy.rules[].match.provider on load", async () => {
     await withTempHome(async (home) => {
-      const configPath = path.join(home, ".openclaw", "openclaw.json");
+      const configPath = path.join(home, ".firstclaw", "firstclaw.json");
       await fs.mkdir(path.dirname(configPath), { recursive: true });
       await fs.writeFile(
         configPath,
@@ -398,7 +337,7 @@ describe("legacy config detection", () => {
   });
   it("rejects messages.queue.byProvider on load", async () => {
     await withTempHome(async (home) => {
-      const configPath = path.join(home, ".openclaw", "openclaw.json");
+      const configPath = path.join(home, ".firstclaw", "firstclaw.json");
       await fs.mkdir(path.dirname(configPath), { recursive: true });
       await fs.writeFile(
         configPath,

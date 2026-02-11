@@ -21,8 +21,8 @@ const mocks = vi.hoisted(() => ({
     scope: "global",
     agents: [],
   })),
-  movePathToTrash: vi.fn(async () => "/trashed"),
   fsAccess: vi.fn(async () => {}),
+  fsRm: vi.fn(async () => {}),
   fsMkdir: vi.fn(async () => undefined),
   fsAppendFile: vi.fn(async () => {}),
 }));
@@ -59,10 +59,6 @@ vi.mock("../../config/sessions/paths.js", () => ({
   resolveSessionTranscriptsDirForAgent: mocks.resolveSessionTranscriptsDirForAgent,
 }));
 
-vi.mock("../../browser/trash.js", () => ({
-  movePathToTrash: mocks.movePathToTrash,
-}));
-
 vi.mock("../../utils.js", () => ({
   resolveUserPath: (p: string) => `/resolved${p.startsWith("/") ? "" : "/"}${p}`,
 }));
@@ -79,6 +75,7 @@ vi.mock("node:fs/promises", async () => {
   const patched = {
     ...actual,
     access: mocks.fsAccess,
+    rm: mocks.fsRm,
     mkdir: mocks.fsMkdir,
     appendFile: mocks.fsAppendFile,
   };
@@ -312,8 +309,8 @@ describe("agents.delete", () => {
       undefined,
     );
     expect(mocks.writeConfigFile).toHaveBeenCalled();
-    // moveToTrashBestEffort calls fs.access then movePathToTrash for each dir
-    expect(mocks.movePathToTrash).toHaveBeenCalled();
+    // moveToTrashBestEffort calls fs.access then fs.rm for each dir
+    expect(mocks.fsRm).toHaveBeenCalled();
   });
 
   it("skips file deletion when deleteFiles is false", async () => {

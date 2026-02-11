@@ -3,7 +3,7 @@ import { validateConfigObject } from "./config.js";
 
 describe("ui.seamColor", () => {
   it("accepts hex colors", () => {
-    const res = validateConfigObject({ ui: { seamColor: "#FF4500" } });
+    const res = validateConfigObject({ ui: { seamColor: "#0EA5E9" } });
     expect(res.ok).toBe(true);
   });
 
@@ -13,7 +13,7 @@ describe("ui.seamColor", () => {
   });
 
   it("rejects invalid hex length", () => {
-    const res = validateConfigObject({ ui: { seamColor: "#FF4500FF" } });
+    const res = validateConfigObject({ ui: { seamColor: "#0EA5E9FF" } });
     expect(res.ok).toBe(false);
   });
 });

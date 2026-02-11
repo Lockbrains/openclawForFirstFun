@@ -30,9 +30,6 @@ vi.mock("../web/session.js", () => ({
 }));
 
 const handleDiscordAction = vi.fn(async () => ({ details: { ok: true } }));
-vi.mock("../agents/tools/discord-actions.js", () => ({
-  handleDiscordAction: (...args: unknown[]) => handleDiscordAction(...args),
-}));
 
 const handleSlackAction = vi.fn(async () => ({ details: { ok: true } }));
 vi.mock("../agents/tools/slack-actions.js", () => ({

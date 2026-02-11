@@ -31,15 +31,15 @@ type OnboardEnv = {
 function captureEnv(): EnvSnapshot {
   return {
     home: process.env.HOME,
-    stateDir: process.env.OPENCLAW_STATE_DIR,
-    configPath: process.env.OPENCLAW_CONFIG_PATH,
-    skipChannels: process.env.OPENCLAW_SKIP_CHANNELS,
-    skipGmail: process.env.OPENCLAW_SKIP_GMAIL_WATCHER,
-    skipCron: process.env.OPENCLAW_SKIP_CRON,
-    skipCanvas: process.env.OPENCLAW_SKIP_CANVAS_HOST,
-    token: process.env.OPENCLAW_GATEWAY_TOKEN,
-    password: process.env.OPENCLAW_GATEWAY_PASSWORD,
-    disableConfigCache: process.env.OPENCLAW_DISABLE_CONFIG_CACHE,
+    stateDir: process.env.FIRSTCLAW_STATE_DIR,
+    configPath: process.env.FIRSTCLAW_CONFIG_PATH,
+    skipChannels: process.env.FIRSTCLAW_SKIP_CHANNELS,
+    skipGmail: process.env.FIRSTCLAW_SKIP_GMAIL_WATCHER,
+    skipCron: process.env.FIRSTCLAW_SKIP_CRON,
+    skipCanvas: process.env.FIRSTCLAW_SKIP_CANVAS_HOST,
+    token: process.env.FIRSTCLAW_GATEWAY_TOKEN,
+    password: process.env.FIRSTCLAW_GATEWAY_PASSWORD,
+    disableConfigCache: process.env.FIRSTCLAW_DISABLE_CONFIG_CACHE,
   };
 }
 
@@ -53,15 +53,15 @@ function restoreEnvVar(key: keyof NodeJS.ProcessEnv, value: string | undefined):
 
 function restoreEnv(prev: EnvSnapshot): void {
   restoreEnvVar("HOME", prev.home);
-  restoreEnvVar("OPENCLAW_STATE_DIR", prev.stateDir);
-  restoreEnvVar("OPENCLAW_CONFIG_PATH", prev.configPath);
-  restoreEnvVar("OPENCLAW_SKIP_CHANNELS", prev.skipChannels);
-  restoreEnvVar("OPENCLAW_SKIP_GMAIL_WATCHER", prev.skipGmail);
-  restoreEnvVar("OPENCLAW_SKIP_CRON", prev.skipCron);
-  restoreEnvVar("OPENCLAW_SKIP_CANVAS_HOST", prev.skipCanvas);
-  restoreEnvVar("OPENCLAW_GATEWAY_TOKEN", prev.token);
-  restoreEnvVar("OPENCLAW_GATEWAY_PASSWORD", prev.password);
-  restoreEnvVar("OPENCLAW_DISABLE_CONFIG_CACHE", prev.disableConfigCache);
+  restoreEnvVar("FIRSTCLAW_STATE_DIR", prev.stateDir);
+  restoreEnvVar("FIRSTCLAW_CONFIG_PATH", prev.configPath);
+  restoreEnvVar("FIRSTCLAW_SKIP_CHANNELS", prev.skipChannels);
+  restoreEnvVar("FIRSTCLAW_SKIP_GMAIL_WATCHER", prev.skipGmail);
+  restoreEnvVar("FIRSTCLAW_SKIP_CRON", prev.skipCron);
+  restoreEnvVar("FIRSTCLAW_SKIP_CANVAS_HOST", prev.skipCanvas);
+  restoreEnvVar("FIRSTCLAW_GATEWAY_TOKEN", prev.token);
+  restoreEnvVar("FIRSTCLAW_GATEWAY_PASSWORD", prev.password);
+  restoreEnvVar("FIRSTCLAW_DISABLE_CONFIG_CACHE", prev.disableConfigCache);
 }
 
 async function withOnboardEnv(
@@ -70,19 +70,19 @@ async function withOnboardEnv(
 ): Promise<void> {
   const prev = captureEnv();
 
-  process.env.OPENCLAW_SKIP_CHANNELS = "1";
-  process.env.OPENCLAW_SKIP_GMAIL_WATCHER = "1";
-  process.env.OPENCLAW_SKIP_CRON = "1";
-  process.env.OPENCLAW_SKIP_CANVAS_HOST = "1";
-  process.env.OPENCLAW_DISABLE_CONFIG_CACHE = "1";
-  delete process.env.OPENCLAW_GATEWAY_TOKEN;
-  delete process.env.OPENCLAW_GATEWAY_PASSWORD;
+  process.env.FIRSTCLAW_SKIP_CHANNELS = "1";
+  process.env.FIRSTCLAW_SKIP_GMAIL_WATCHER = "1";
+  process.env.FIRSTCLAW_SKIP_CRON = "1";
+  process.env.FIRSTCLAW_SKIP_CANVAS_HOST = "1";
+  process.env.FIRSTCLAW_DISABLE_CONFIG_CACHE = "1";
+  delete process.env.FIRSTCLAW_GATEWAY_TOKEN;
+  delete process.env.FIRSTCLAW_GATEWAY_PASSWORD;
 
   const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
-  const configPath = path.join(tempHome, "openclaw.json");
+  const configPath = path.join(tempHome, "firstclaw.json");
   process.env.HOME = tempHome;
-  process.env.OPENCLAW_STATE_DIR = tempHome;
-  process.env.OPENCLAW_CONFIG_PATH = configPath;
+  process.env.FIRSTCLAW_STATE_DIR = tempHome;
+  process.env.FIRSTCLAW_CONFIG_PATH = configPath;
   vi.resetModules();
 
   const runtime: RuntimeMock = {
@@ -136,7 +136,7 @@ async function expectApiKeyProfile(params: {
 
 describe("onboard (non-interactive): provider auth", () => {
   it("stores xAI API key and sets default model", async () => {
-    await withOnboardEnv("openclaw-onboard-xai-", async ({ configPath, runtime }) => {
+    await withOnboardEnv("firstclaw-onboard-xai-", async ({ configPath, runtime }) => {
       await runNonInteractive(
         {
           nonInteractive: true,
@@ -163,7 +163,7 @@ describe("onboard (non-interactive): provider auth", () => {
   }, 60_000);
 
   it("stores Vercel AI Gateway API key and sets default model", async () => {
-    await withOnboardEnv("openclaw-onboard-ai-gateway-", async ({ configPath, runtime }) => {
+    await withOnboardEnv("firstclaw-onboard-ai-gateway-", async ({ configPath, runtime }) => {
       await runNonInteractive(
         {
           nonInteractive: true,
@@ -196,7 +196,7 @@ describe("onboard (non-interactive): provider auth", () => {
   }, 60_000);
 
   it("stores token auth profile", async () => {
-    await withOnboardEnv("openclaw-onboard-token-", async ({ configPath, runtime }) => {
+    await withOnboardEnv("firstclaw-onboard-token-", async ({ configPath, runtime }) => {
       const token = `sk-ant-oat01-${"a".repeat(80)}`;
 
       await runNonInteractive(
@@ -232,7 +232,7 @@ describe("onboard (non-interactive): provider auth", () => {
   }, 60_000);
 
   it("stores OpenAI API key and sets OpenAI default model", async () => {
-    await withOnboardEnv("openclaw-onboard-openai-", async ({ configPath, runtime }) => {
+    await withOnboardEnv("firstclaw-onboard-openai-", async ({ configPath, runtime }) => {
       await runNonInteractive(
         {
           nonInteractive: true,
@@ -255,7 +255,7 @@ describe("onboard (non-interactive): provider auth", () => {
   }, 60_000);
 
   it("stores Cloudflare AI Gateway API key and metadata", async () => {
-    await withOnboardEnv("openclaw-onboard-cf-gateway-", async ({ configPath, runtime }) => {
+    await withOnboardEnv("firstclaw-onboard-cf-gateway-", async ({ configPath, runtime }) => {
       await runNonInteractive(
         {
           nonInteractive: true,
@@ -291,7 +291,7 @@ describe("onboard (non-interactive): provider auth", () => {
   }, 60_000);
 
   it("infers Cloudflare auth choice from API key flags", async () => {
-    await withOnboardEnv("openclaw-onboard-cf-gateway-infer-", async ({ configPath, runtime }) => {
+    await withOnboardEnv("firstclaw-onboard-cf-gateway-infer-", async ({ configPath, runtime }) => {
       await runNonInteractive(
         {
           nonInteractive: true,

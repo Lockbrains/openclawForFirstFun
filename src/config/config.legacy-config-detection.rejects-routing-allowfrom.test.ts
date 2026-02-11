@@ -23,65 +23,24 @@ describe("legacy config detection", () => {
       expect(res.issues[0]?.path).toBe("routing.groupChat.requireMention");
     }
   });
-  it("migrates routing.allowFrom to channels.whatsapp.allowFrom when whatsapp configured", async () => {
-    vi.resetModules();
-    const { migrateLegacyConfig } = await import("./config.js");
-    const res = migrateLegacyConfig({
-      routing: { allowFrom: ["+15555550123"] },
-      channels: { whatsapp: {} },
-    });
-    expect(res.changes).toContain("Moved routing.allowFrom → channels.whatsapp.allowFrom.");
-    expect(res.config?.channels?.whatsapp?.allowFrom).toEqual(["+15555550123"]);
-    expect(res.config?.routing?.allowFrom).toBeUndefined();
-  });
-  it("drops routing.allowFrom when whatsapp missing", async () => {
+  it("drops routing.allowFrom when no channel configured", async () => {
     vi.resetModules();
     const { migrateLegacyConfig } = await import("./config.js");
     const res = migrateLegacyConfig({
       routing: { allowFrom: ["+15555550123"] },
     });
     expect(res.changes).toContain("Removed routing.allowFrom (channels.whatsapp not configured).");
-    expect(res.config?.channels?.whatsapp).toBeUndefined();
     expect(res.config?.routing?.allowFrom).toBeUndefined();
   });
-  it("migrates routing.groupChat.requireMention to channels whatsapp/telegram/imessage groups when whatsapp configured", async () => {
-    vi.resetModules();
-    const { migrateLegacyConfig } = await import("./config.js");
-    const res = migrateLegacyConfig({
-      routing: { groupChat: { requireMention: false } },
-      channels: { whatsapp: {} },
-    });
-    expect(res.changes).toContain(
-      'Moved routing.groupChat.requireMention → channels.whatsapp.groups."*".requireMention.',
-    );
-    expect(res.changes).toContain(
-      'Moved routing.groupChat.requireMention → channels.telegram.groups."*".requireMention.',
-    );
-    expect(res.changes).toContain(
-      'Moved routing.groupChat.requireMention → channels.imessage.groups."*".requireMention.',
-    );
-    expect(res.config?.channels?.whatsapp?.groups?.["*"]?.requireMention).toBe(false);
-    expect(res.config?.channels?.telegram?.groups?.["*"]?.requireMention).toBe(false);
-    expect(res.config?.channels?.imessage?.groups?.["*"]?.requireMention).toBe(false);
-    expect(res.config?.routing?.groupChat?.requireMention).toBeUndefined();
-  });
-  it("migrates routing.groupChat.requireMention to telegram/imessage when whatsapp missing", async () => {
+  it("migrates routing.groupChat.requireMention to channels.imessage groups", async () => {
     vi.resetModules();
     const { migrateLegacyConfig } = await import("./config.js");
     const res = migrateLegacyConfig({
       routing: { groupChat: { requireMention: false } },
     });
     expect(res.changes).toContain(
-      'Moved routing.groupChat.requireMention → channels.telegram.groups."*".requireMention.',
-    );
-    expect(res.changes).toContain(
       'Moved routing.groupChat.requireMention → channels.imessage.groups."*".requireMention.',
     );
-    expect(res.changes).not.toContain(
-      'Moved routing.groupChat.requireMention → channels.whatsapp.groups."*".requireMention.',
-    );
-    expect(res.config?.channels?.whatsapp).toBeUndefined();
-    expect(res.config?.channels?.telegram?.groups?.["*"]?.requireMention).toBe(false);
     expect(res.config?.channels?.imessage?.groups?.["*"]?.requireMention).toBe(false);
     expect(res.config?.routing?.groupChat?.requireMention).toBeUndefined();
   });
@@ -89,12 +48,12 @@ describe("legacy config detection", () => {
     vi.resetModules();
     const { migrateLegacyConfig } = await import("./config.js");
     const res = migrateLegacyConfig({
-      routing: { groupChat: { mentionPatterns: ["@openclaw"] } },
+      routing: { groupChat: { mentionPatterns: ["@firstclaw"] } },
     });
     expect(res.changes).toContain(
       "Moved routing.groupChat.mentionPatterns → messages.groupChat.mentionPatterns.",
     );
-    expect(res.config?.messages?.groupChat?.mentionPatterns).toEqual(["@openclaw"]);
+    expect(res.config?.messages?.groupChat?.mentionPatterns).toEqual(["@firstclaw"]);
     expect(res.config?.routing?.groupChat?.mentionPatterns).toBeUndefined();
   });
   it("migrates routing agentToAgent/queue/transcribeAudio to tools/messages/media", async () => {
@@ -141,7 +100,7 @@ describe("legacy config detection", () => {
       agent: {
         model: "openai/gpt-5.2",
         tools: { allow: ["sessions.list"], deny: ["danger"] },
-        elevated: { enabled: true, allowFrom: { discord: ["user:1"] } },
+        elevated: { enabled: true, allowFrom: { imessage: ["+15555550123"] } },
         bash: { timeoutSec: 12 },
         sandbox: { tools: { allow: ["browser.open"] } },
         subagents: { tools: { deny: ["sandbox"] } },
@@ -162,7 +121,7 @@ describe("legacy config detection", () => {
     expect(res.config?.tools?.deny).toEqual(["danger"]);
     expect(res.config?.tools?.elevated).toEqual({
       enabled: true,
-      allowFrom: { discord: ["user:1"] },
+      allowFrom: { imessage: ["+15555550123"] },
     });
     expect(res.config?.tools?.exec).toEqual({ timeoutSec: 12 });
     expect(res.config?.tools?.sandbox?.tools).toEqual({
@@ -268,18 +227,18 @@ describe("legacy config detection", () => {
     const res = validateConfigObject({
       tools: {
         elevated: {
-          allowFrom: { whatsapp: ["+15555550123"] },
+          allowFrom: { imessage: ["+15555550123"] },
         },
       },
       agents: {
         list: [
           {
             id: "work",
-            workspace: "~/openclaw-work",
+            workspace: "~/firstclaw-work",
             tools: {
               elevated: {
                 enabled: false,
-                allowFrom: { whatsapp: ["+15555550123"] },
+                allowFrom: { imessage: ["+15555550123"] },
               },
             },
           },
@@ -290,19 +249,8 @@ describe("legacy config detection", () => {
     if (res.ok) {
       expect(res.config?.agents?.list?.[0]?.tools?.elevated).toEqual({
         enabled: false,
-        allowFrom: { whatsapp: ["+15555550123"] },
+        allowFrom: { imessage: ["+15555550123"] },
       });
-    }
-  });
-  it("rejects telegram.requireMention", async () => {
-    vi.resetModules();
-    const { validateConfigObject } = await import("./config.js");
-    const res = validateConfigObject({
-      telegram: { requireMention: true },
-    });
-    expect(res.ok).toBe(false);
-    if (!res.ok) {
-      expect(res.issues.some((issue) => issue.path === "telegram.requireMention")).toBe(true);
     }
   });
   it("rejects gateway.token", async () => {
@@ -342,164 +290,21 @@ describe("legacy config detection", () => {
       expect(validated.config.gateway?.bind).toBe("tailnet");
     }
   });
-  it('rejects telegram.dmPolicy="open" without allowFrom "*"', async () => {
-    vi.resetModules();
-    const { validateConfigObject } = await import("./config.js");
-    const res = validateConfigObject({
-      channels: { telegram: { dmPolicy: "open", allowFrom: ["123456789"] } },
-    });
-    expect(res.ok).toBe(false);
-    if (!res.ok) {
-      expect(res.issues[0]?.path).toBe("channels.telegram.allowFrom");
-    }
-  });
-  it('accepts telegram.dmPolicy="open" with allowFrom "*"', async () => {
-    vi.resetModules();
-    const { validateConfigObject } = await import("./config.js");
-    const res = validateConfigObject({
-      channels: { telegram: { dmPolicy: "open", allowFrom: ["*"] } },
-    });
-    expect(res.ok).toBe(true);
-    if (res.ok) {
-      expect(res.config.channels?.telegram?.dmPolicy).toBe("open");
-    }
-  });
-  it("defaults telegram.dmPolicy to pairing when telegram section exists", async () => {
-    vi.resetModules();
-    const { validateConfigObject } = await import("./config.js");
-    const res = validateConfigObject({ channels: { telegram: {} } });
-    expect(res.ok).toBe(true);
-    if (res.ok) {
-      expect(res.config.channels?.telegram?.dmPolicy).toBe("pairing");
-    }
-  });
-  it("defaults telegram.groupPolicy to allowlist when telegram section exists", async () => {
-    vi.resetModules();
-    const { validateConfigObject } = await import("./config.js");
-    const res = validateConfigObject({ channels: { telegram: {} } });
-    expect(res.ok).toBe(true);
-    if (res.ok) {
-      expect(res.config.channels?.telegram?.groupPolicy).toBe("allowlist");
-    }
-  });
-  it("defaults telegram.streamMode to partial when telegram section exists", async () => {
-    vi.resetModules();
-    const { validateConfigObject } = await import("./config.js");
-    const res = validateConfigObject({ channels: { telegram: {} } });
-    expect(res.ok).toBe(true);
-    if (res.ok) {
-      expect(res.config.channels?.telegram?.streamMode).toBe("partial");
-    }
-  });
-  it('rejects whatsapp.dmPolicy="open" without allowFrom "*"', async () => {
-    vi.resetModules();
-    const { validateConfigObject } = await import("./config.js");
-    const res = validateConfigObject({
-      channels: {
-        whatsapp: { dmPolicy: "open", allowFrom: ["+15555550123"] },
-      },
-    });
-    expect(res.ok).toBe(false);
-    if (!res.ok) {
-      expect(res.issues[0]?.path).toBe("channels.whatsapp.allowFrom");
-    }
-  });
-  it('accepts whatsapp.dmPolicy="open" with allowFrom "*"', async () => {
-    vi.resetModules();
-    const { validateConfigObject } = await import("./config.js");
-    const res = validateConfigObject({
-      channels: { whatsapp: { dmPolicy: "open", allowFrom: ["*"] } },
-    });
-    expect(res.ok).toBe(true);
-    if (res.ok) {
-      expect(res.config.channels?.whatsapp?.dmPolicy).toBe("open");
-    }
-  });
-  it("defaults whatsapp.dmPolicy to pairing when whatsapp section exists", async () => {
-    vi.resetModules();
-    const { validateConfigObject } = await import("./config.js");
-    const res = validateConfigObject({ channels: { whatsapp: {} } });
-    expect(res.ok).toBe(true);
-    if (res.ok) {
-      expect(res.config.channels?.whatsapp?.dmPolicy).toBe("pairing");
-    }
-  });
-  it("defaults whatsapp.groupPolicy to allowlist when whatsapp section exists", async () => {
-    vi.resetModules();
-    const { validateConfigObject } = await import("./config.js");
-    const res = validateConfigObject({ channels: { whatsapp: {} } });
-    expect(res.ok).toBe(true);
-    if (res.ok) {
-      expect(res.config.channels?.whatsapp?.groupPolicy).toBe("allowlist");
-    }
-  });
-  it('rejects signal.dmPolicy="open" without allowFrom "*"', async () => {
-    vi.resetModules();
-    const { validateConfigObject } = await import("./config.js");
-    const res = validateConfigObject({
-      channels: { signal: { dmPolicy: "open", allowFrom: ["+15555550123"] } },
-    });
-    expect(res.ok).toBe(false);
-    if (!res.ok) {
-      expect(res.issues[0]?.path).toBe("channels.signal.allowFrom");
-    }
-  });
-  it('accepts signal.dmPolicy="open" with allowFrom "*"', async () => {
-    vi.resetModules();
-    const { validateConfigObject } = await import("./config.js");
-    const res = validateConfigObject({
-      channels: { signal: { dmPolicy: "open", allowFrom: ["*"] } },
-    });
-    expect(res.ok).toBe(true);
-    if (res.ok) {
-      expect(res.config.channels?.signal?.dmPolicy).toBe("open");
-    }
-  });
-  it("defaults signal.dmPolicy to pairing when signal section exists", async () => {
-    vi.resetModules();
-    const { validateConfigObject } = await import("./config.js");
-    const res = validateConfigObject({ channels: { signal: {} } });
-    expect(res.ok).toBe(true);
-    if (res.ok) {
-      expect(res.config.channels?.signal?.dmPolicy).toBe("pairing");
-    }
-  });
-  it("defaults signal.groupPolicy to allowlist when signal section exists", async () => {
-    vi.resetModules();
-    const { validateConfigObject } = await import("./config.js");
-    const res = validateConfigObject({ channels: { signal: {} } });
-    expect(res.ok).toBe(true);
-    if (res.ok) {
-      expect(res.config.channels?.signal?.groupPolicy).toBe("allowlist");
-    }
-  });
-  it("accepts historyLimit overrides per provider and account", async () => {
+  it("accepts historyLimit overrides per channel and account", async () => {
     vi.resetModules();
     const { validateConfigObject } = await import("./config.js");
     const res = validateConfigObject({
       messages: { groupChat: { historyLimit: 12 } },
       channels: {
-        whatsapp: { historyLimit: 9, accounts: { work: { historyLimit: 4 } } },
-        telegram: { historyLimit: 8, accounts: { ops: { historyLimit: 3 } } },
-        slack: { historyLimit: 7, accounts: { ops: { historyLimit: 2 } } },
-        signal: { historyLimit: 6 },
-        imessage: { historyLimit: 5 },
-        msteams: { historyLimit: 4 },
-        discord: { historyLimit: 3 },
+        imessage: { historyLimit: 5, accounts: { work: { historyLimit: 4 } } },
+        bluebubbles: { historyLimit: 3 },
       },
     });
     expect(res.ok).toBe(true);
     if (res.ok) {
-      expect(res.config.channels?.whatsapp?.historyLimit).toBe(9);
-      expect(res.config.channels?.whatsapp?.accounts?.work?.historyLimit).toBe(4);
-      expect(res.config.channels?.telegram?.historyLimit).toBe(8);
-      expect(res.config.channels?.telegram?.accounts?.ops?.historyLimit).toBe(3);
-      expect(res.config.channels?.slack?.historyLimit).toBe(7);
-      expect(res.config.channels?.slack?.accounts?.ops?.historyLimit).toBe(2);
-      expect(res.config.channels?.signal?.historyLimit).toBe(6);
       expect(res.config.channels?.imessage?.historyLimit).toBe(5);
-      expect(res.config.channels?.msteams?.historyLimit).toBe(4);
-      expect(res.config.channels?.discord?.historyLimit).toBe(3);
+      expect(res.config.channels?.imessage?.accounts?.work?.historyLimit).toBe(4);
+      expect(res.config.channels?.bluebubbles?.historyLimit).toBe(3);
     }
   });
   it('rejects imessage.dmPolicy="open" without allowFrom "*"', async () => {

@@ -7,10 +7,6 @@ const stubTool = (name: string) => ({
   execute: vi.fn(),
 });
 
-vi.mock("../tools/browser-tool.js", () => ({
-  createBrowserTool: () => stubTool("browser"),
-}));
-
 vi.mock("../tools/canvas-tool.js", () => ({
   createCanvasTool: () => stubTool("canvas"),
 }));

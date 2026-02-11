@@ -27,10 +27,10 @@ async function withTempHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
     },
     {
       env: {
-        OPENCLAW_AGENT_DIR: (home) => path.join(home, ".openclaw", "agent"),
-        PI_CODING_AGENT_DIR: (home) => path.join(home, ".openclaw", "agent"),
+        FIRSTCLAW_AGENT_DIR: (home) => path.join(home, ".firstclaw", "agent"),
+        PI_CODING_AGENT_DIR: (home) => path.join(home, ".firstclaw", "agent"),
       },
-      prefix: "openclaw-reply-",
+      prefix: "firstclaw-reply-",
     },
   );
 }
@@ -71,7 +71,7 @@ describe("directive behavior", () => {
           agents: {
             defaults: {
               model: "anthropic/claude-opus-4-5",
-              workspace: path.join(home, "openclaw"),
+              workspace: path.join(home, "firstclaw"),
               verboseDefault: "on",
             },
           },
@@ -96,7 +96,7 @@ describe("directive behavior", () => {
           agents: {
             defaults: {
               model: "anthropic/claude-opus-4-5",
-              workspace: path.join(home, "openclaw"),
+              workspace: path.join(home, "firstclaw"),
             },
           },
           session: { store: path.join(home, "sessions.json") },
@@ -127,7 +127,7 @@ describe("directive behavior", () => {
           agents: {
             defaults: {
               model: "anthropic/claude-opus-4-5",
-              workspace: path.join(home, "openclaw"),
+              workspace: path.join(home, "firstclaw"),
               elevatedDefault: "on",
             },
           },
@@ -163,7 +163,7 @@ describe("directive behavior", () => {
           agents: {
             defaults: {
               model: "anthropic/claude-opus-4-5",
-              workspace: path.join(home, "openclaw"),
+              workspace: path.join(home, "firstclaw"),
             },
           },
           tools: {
@@ -207,7 +207,7 @@ describe("directive behavior", () => {
           agents: {
             defaults: {
               model: "anthropic/claude-opus-4-5",
-              workspace: path.join(home, "openclaw"),
+              workspace: path.join(home, "firstclaw"),
               elevatedDefault: "on",
             },
           },
@@ -256,7 +256,7 @@ describe("directive behavior", () => {
           agents: {
             defaults: {
               model: "anthropic/claude-opus-4-5",
-              workspace: path.join(home, "openclaw"),
+              workspace: path.join(home, "firstclaw"),
               elevatedDefault: "on",
             },
           },

@@ -81,11 +81,16 @@ export function createFeishuWSClient(account: ResolvedFeishuAccount): Lark.WSCli
     throw new Error(`Feishu credentials not configured for account "${accountId}"`);
   }
 
+  const resolvedDomain = resolveDomain(domain);
+  console.log(
+    `[feishu] WSClient domain: input="${domain}", resolved=${JSON.stringify(resolvedDomain)} (Lark.Domain.Lark=${Lark.Domain.Lark})`,
+  );
+
   return new Lark.WSClient({
     appId,
     appSecret,
-    domain: resolveDomain(domain),
-    loggerLevel: Lark.LoggerLevel.info,
+    domain: resolvedDomain,
+    loggerLevel: Lark.LoggerLevel.debug,
   });
 }
 

@@ -55,8 +55,6 @@ const READ_METHODS = new Set([
   "status",
   "usage.status",
   "usage.cost",
-  "tts.status",
-  "tts.providers",
   "models.list",
   "agents.list",
   "agent.identity.get",
@@ -79,15 +77,10 @@ const WRITE_METHODS = new Set([
   "agent.wait",
   "wake",
   "talk.mode",
-  "tts.enable",
-  "tts.disable",
-  "tts.convert",
-  "tts.setProvider",
   "voicewake.set",
   "node.invoke",
   "chat.send",
   "chat.abort",
-  "browser.request",
 ]);
 
 function authorizeGatewayMethod(method: string, client: GatewayRequestOptions["client"]) {

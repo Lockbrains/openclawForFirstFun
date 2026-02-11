@@ -1,19 +1,23 @@
-import type { OpenClawConfig } from "../config/config.js";
+import type { FirstClawConfig } from "../config/config.js";
 
-const DEFAULT_AGENT_TIMEOUT_SECONDS = 600;
+// FirstClaw: Reduced default timeout from 600s to 120s to limit runaway cost.
+// Hard ceiling ensures no single agent run can exceed 5 minutes.
+const DEFAULT_AGENT_TIMEOUT_SECONDS = 120;
+const MAX_AGENT_TIMEOUT_SECONDS = 300;
 const MAX_SAFE_TIMEOUT_MS = 2_147_000_000;
 
 const normalizeNumber = (value: unknown): number | undefined =>
   typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : undefined;
 
-export function resolveAgentTimeoutSeconds(cfg?: OpenClawConfig): number {
+export function resolveAgentTimeoutSeconds(cfg?: FirstClawConfig): number {
   const raw = normalizeNumber(cfg?.agents?.defaults?.timeoutSeconds);
   const seconds = raw ?? DEFAULT_AGENT_TIMEOUT_SECONDS;
-  return Math.max(seconds, 1);
+  // FirstClaw: Enforce hard ceiling on agent timeout
+  return Math.min(Math.max(seconds, 1), MAX_AGENT_TIMEOUT_SECONDS);
 }
 
 export function resolveAgentTimeoutMs(opts: {
-  cfg?: OpenClawConfig;
+  cfg?: FirstClawConfig;
   overrideMs?: number | null;
   overrideSeconds?: number | null;
   minMs?: number;

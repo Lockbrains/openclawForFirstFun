@@ -1,11 +1,11 @@
-import { createHash, randomBytes } from "node:crypto";
-import { createServer } from "node:http";
 import {
   emptyPluginConfigSchema,
   isWSL2Sync,
-  type OpenClawPluginApi,
+  type FirstClawPluginApi,
   type ProviderAuthContext,
-} from "openclaw/plugin-sdk";
+} from "firstclaw/plugin-sdk";
+import { createHash, randomBytes } from "node:crypto";
+import { createServer } from "node:http";
 
 // OAuth constants - decoded from pi-ai's base64 encoded values to stay in sync
 const decode = (s: string) => Buffer.from(s, "base64").toString();
@@ -36,7 +36,7 @@ const RESPONSE_PAGE = `<!DOCTYPE html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <title>OpenClaw Antigravity OAuth</title>
+    <title>FirstClaw Antigravity OAuth</title>
   </head>
   <body>
     <main>
@@ -372,7 +372,7 @@ const antigravityPlugin = {
   name: "Google Antigravity Auth",
   description: "OAuth flow for Google Antigravity (Cloud Code Assist)",
   configSchema: emptyPluginConfigSchema(),
-  register(api: OpenClawPluginApi) {
+  register(api: FirstClawPluginApi) {
     api.registerProvider({
       id: "google-antigravity",
       label: "Google Antigravity",

@@ -1,4 +1,4 @@
-import type { OpenClawConfig } from "../../config/config.js";
+import type { FirstClawConfig } from "../../config/config.js";
 import {
   getChannelPlugin,
   normalizeChannelId as normalizeAnyChannelId,
@@ -7,8 +7,10 @@ import { normalizeChannelId as normalizeChatChannelId } from "../../channels/reg
 
 const ANNOUNCE_SKIP_TOKEN = "ANNOUNCE_SKIP";
 const REPLY_SKIP_TOKEN = "REPLY_SKIP";
-const DEFAULT_PING_PONG_TURNS = 5;
-const MAX_PING_PONG_TURNS = 5;
+// FirstClaw: Lowered defaults to prevent token explosion from subagent bouncing.
+// Hard ceiling at 3 turns; default to 2 for safety.
+const DEFAULT_PING_PONG_TURNS = 2;
+const MAX_PING_PONG_TURNS = 3;
 
 export type AnnounceTarget = {
   channel: string;
@@ -155,7 +157,7 @@ export function isReplySkip(text?: string) {
   return (text ?? "").trim() === REPLY_SKIP_TOKEN;
 }
 
-export function resolvePingPongTurns(cfg?: OpenClawConfig) {
+export function resolvePingPongTurns(cfg?: FirstClawConfig) {
   const raw = cfg?.session?.agentToAgent?.maxPingPongTurns;
   const fallback = DEFAULT_PING_PONG_TURNS;
   if (typeof raw !== "number" || !Number.isFinite(raw)) {

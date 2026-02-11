@@ -19,7 +19,7 @@ export function parseRelaySmokeTest(args: string[], env: NodeJS.ProcessEnv): Rel
 
   // Back-compat: only run env-based smoke mode when no CLI args are present,
   // to avoid surprising early-exit when users set env vars globally.
-  if (args.length === 0 && (env.OPENCLAW_SMOKE_QR === "1" || env.OPENCLAW_SMOKE === "qr")) {
+  if (args.length === 0 && (env.FIRSTCLAW_SMOKE_QR === "1" || env.FIRSTCLAW_SMOKE === "qr")) {
     return "qr";
   }
 
@@ -29,8 +29,7 @@ export function parseRelaySmokeTest(args: string[], env: NodeJS.ProcessEnv): Rel
 export async function runRelaySmokeTest(test: RelaySmokeTest): Promise<void> {
   switch (test) {
     case "qr": {
-      const { renderQrPngBase64 } = await import("../web/qr-image.js");
-      await renderQrPngBase64("smoke-test");
+      // Stub: web/qr-image module removed; QR smoke test disabled
       return;
     }
   }

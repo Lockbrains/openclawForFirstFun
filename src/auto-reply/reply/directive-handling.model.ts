@@ -1,4 +1,4 @@
-import type { OpenClawConfig } from "../../config/config.js";
+import type { FirstClawConfig } from "../../config/config.js";
 import type { ReplyPayload } from "../types.js";
 import type { InlineDirectives } from "./directive-handling.parse.js";
 import { resolveAuthStorePathForDisplay } from "../../agents/auth-profiles.js";
@@ -9,7 +9,6 @@ import {
   resolveConfiguredModelRef,
   resolveModelRefFromString,
 } from "../../agents/model-selection.js";
-import { buildBrowseProvidersButton } from "../../telegram/model-buttons.js";
 import { shortenHomePath } from "../../utils.js";
 import { resolveModelsCommandReply } from "./commands-models.js";
 import {
@@ -25,7 +24,7 @@ import {
 import { type ModelDirectiveSelection, resolveModelDirectiveSelection } from "./model-selection.js";
 
 function buildModelPickerCatalog(params: {
-  cfg: OpenClawConfig;
+  cfg: FirstClawConfig;
   defaultProvider: string;
   defaultModel: string;
   aliasIndex: ModelAliasIndex;
@@ -168,7 +167,7 @@ function buildModelPickerCatalog(params: {
 
 export async function maybeHandleModelDirectiveInfo(params: {
   directives: InlineDirectives;
-  cfg: OpenClawConfig;
+  cfg: FirstClawConfig;
   agentDir: string;
   activeAgentId: string;
   provider: string;
@@ -215,22 +214,6 @@ export async function maybeHandleModelDirectiveInfo(params: {
 
   if (wantsSummary) {
     const current = `${params.provider}/${params.model}`;
-    const isTelegram = params.surface === "telegram";
-
-    if (isTelegram) {
-      const buttons = buildBrowseProvidersButton();
-      return {
-        text: [
-          `Current: ${current}`,
-          "",
-          "Tap below to browse models, or use:",
-          "/model <provider/model> to switch",
-          "/model status for details",
-        ].join("\n"),
-        channelData: { telegram: { buttons } },
-      };
-    }
-
     return {
       text: [
         `Current: ${current}`,
@@ -313,7 +296,7 @@ export async function maybeHandleModelDirectiveInfo(params: {
 
 export function resolveModelSelectionFromDirective(params: {
   directives: InlineDirectives;
-  cfg: OpenClawConfig;
+  cfg: FirstClawConfig;
   agentDir: string;
   defaultProvider: string;
   defaultModel: string;

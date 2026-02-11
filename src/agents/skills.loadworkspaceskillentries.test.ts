@@ -28,7 +28,7 @@ ${body ?? `# ${name}\n`}
 
 describe("loadWorkspaceSkillEntries", () => {
   it("handles an empty managed skills dir without throwing", async () => {
-    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-"));
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "firstclaw-"));
     const managedDir = path.join(workspaceDir, ".managed");
     await fs.mkdir(managedDir, { recursive: true });
 
@@ -41,17 +41,22 @@ describe("loadWorkspaceSkillEntries", () => {
   });
 
   it("includes plugin-shipped skills when the plugin is enabled", async () => {
-    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-"));
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "firstclaw-"));
     const managedDir = path.join(workspaceDir, ".managed");
     const bundledDir = path.join(workspaceDir, ".bundled");
-    const pluginRoot = path.join(workspaceDir, ".openclaw", "extensions", "open-prose");
+    const pluginRoot = path.join(workspaceDir, ".firstclaw", "extensions", "feishu");
 
     await fs.mkdir(path.join(pluginRoot, "skills", "prose"), { recursive: true });
     await fs.writeFile(
-      path.join(pluginRoot, "openclaw.plugin.json"),
+      path.join(pluginRoot, "index.ts"),
+      "export default { id: 'feishu', register() {} };",
+      "utf-8",
+    );
+    await fs.writeFile(
+      path.join(pluginRoot, "firstclaw.plugin.json"),
       JSON.stringify(
         {
-          id: "open-prose",
+          id: "feishu",
           skills: ["./skills"],
           configSchema: { type: "object", additionalProperties: false, properties: {} },
         },
@@ -69,7 +74,7 @@ describe("loadWorkspaceSkillEntries", () => {
     const entries = loadWorkspaceSkillEntries(workspaceDir, {
       config: {
         plugins: {
-          entries: { "open-prose": { enabled: true } },
+          entries: { feishu: { enabled: true } },
         },
       },
       managedSkillsDir: managedDir,
@@ -80,17 +85,22 @@ describe("loadWorkspaceSkillEntries", () => {
   });
 
   it("excludes plugin-shipped skills when the plugin is not allowed", async () => {
-    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-"));
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "firstclaw-"));
     const managedDir = path.join(workspaceDir, ".managed");
     const bundledDir = path.join(workspaceDir, ".bundled");
-    const pluginRoot = path.join(workspaceDir, ".openclaw", "extensions", "open-prose");
+    const pluginRoot = path.join(workspaceDir, ".firstclaw", "extensions", "feishu");
 
     await fs.mkdir(path.join(pluginRoot, "skills", "prose"), { recursive: true });
     await fs.writeFile(
-      path.join(pluginRoot, "openclaw.plugin.json"),
+      path.join(pluginRoot, "index.ts"),
+      "export default { id: 'feishu', register() {} };",
+      "utf-8",
+    );
+    await fs.writeFile(
+      path.join(pluginRoot, "firstclaw.plugin.json"),
       JSON.stringify(
         {
-          id: "open-prose",
+          id: "feishu",
           skills: ["./skills"],
           configSchema: { type: "object", additionalProperties: false, properties: {} },
         },
@@ -108,7 +118,7 @@ describe("loadWorkspaceSkillEntries", () => {
     const entries = loadWorkspaceSkillEntries(workspaceDir, {
       config: {
         plugins: {
-          allow: ["something-else"],
+          allow: ["imessage"],
         },
       },
       managedSkillsDir: managedDir,

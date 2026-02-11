@@ -1,11 +1,11 @@
 import type { CliDeps } from "../../../cli/deps.js";
-import type { OpenClawConfig } from "../../../config/config.js";
+import type { FirstClawConfig } from "../../../config/config.js";
 import type { HookHandler } from "../../hooks.js";
 import { createDefaultDeps } from "../../../cli/deps.js";
 import { runBootOnce } from "../../../gateway/boot.js";
 
 type BootHookContext = {
-  cfg?: OpenClawConfig;
+  cfg?: FirstClawConfig;
   workspaceDir?: string;
   deps?: CliDeps;
 };

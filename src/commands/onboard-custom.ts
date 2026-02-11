@@ -1,4 +1,4 @@
-import type { OpenClawConfig } from "../config/config.js";
+import type { FirstClawConfig } from "../config/config.js";
 import type { ModelProviderConfig } from "../config/types.models.js";
 import type { RuntimeEnv } from "../runtime.js";
 import type { WizardPrompter } from "../wizard/prompts.js";
@@ -16,7 +16,7 @@ const VERIFY_TIMEOUT_MS = 10000;
 type CustomApiCompatibility = "openai" | "anthropic";
 type CustomApiCompatibilityChoice = CustomApiCompatibility | "unknown";
 type CustomApiResult = {
-  config: OpenClawConfig;
+  config: FirstClawConfig;
   providerId?: string;
   modelId?: string;
 };
@@ -87,7 +87,7 @@ function resolveUniqueEndpointId(params: {
 
 function resolveAliasError(params: {
   raw: string;
-  cfg: OpenClawConfig;
+  cfg: FirstClawConfig;
   modelRef: string;
 }): string | undefined {
   const trimmed = params.raw.trim();
@@ -249,7 +249,7 @@ async function promptBaseUrlAndKey(params: {
 export async function promptCustomApiConfig(params: {
   prompter: WizardPrompter;
   runtime: RuntimeEnv;
-  config: OpenClawConfig;
+  config: FirstClawConfig;
 }): Promise<CustomApiResult> {
   const { prompter, runtime, config } = params;
 
@@ -433,7 +433,7 @@ export async function promptCustomApiConfig(params: {
   const { apiKey: existingApiKey, ...existingProviderRest } = existingProvider ?? {};
   const normalizedApiKey = apiKey.trim() || (existingApiKey ? existingApiKey.trim() : undefined);
 
-  let newConfig: OpenClawConfig = {
+  let newConfig: FirstClawConfig = {
     ...config,
     models: {
       ...config.models,

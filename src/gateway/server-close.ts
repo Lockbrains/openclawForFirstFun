@@ -1,7 +1,9 @@
 import type { Server as HttpServer } from "node:http";
 import type { WebSocketServer } from "ws";
-import type { CanvasHostHandler, CanvasHostServer } from "../canvas-host/server.js";
 import type { HeartbeatRunner } from "../infra/heartbeat-runner.js";
+
+/** Minimal closeable handle (canvas-host removed). */
+type CloseableHandle = { close: () => Promise<void> } | null;
 import type { PluginServicesHandle } from "../plugins/services.js";
 import { type ChannelId, listChannelPlugins } from "../channels/plugins/index.js";
 import { stopGmailWatcher } from "../hooks/gmail-watcher.js";
@@ -9,8 +11,8 @@ import { stopGmailWatcher } from "../hooks/gmail-watcher.js";
 export function createGatewayCloseHandler(params: {
   bonjourStop: (() => Promise<void>) | null;
   tailscaleCleanup: (() => Promise<void>) | null;
-  canvasHost: CanvasHostHandler | null;
-  canvasHostServer: CanvasHostServer | null;
+  canvasHost: CloseableHandle;
+  canvasHostServer: CloseableHandle;
   stopChannel: (name: ChannelId, accountId?: string) => Promise<void>;
   pluginServices: PluginServicesHandle | null;
   cron: { stop: () => void };
@@ -25,7 +27,6 @@ export function createGatewayCloseHandler(params: {
   chatRunState: { clear: () => void };
   clients: Set<{ socket: { close: (code: number, reason: string) => void } }>;
   configReloader: { stop: () => Promise<void> };
-  browserControl: { stop: () => Promise<void> } | null;
   wss: WebSocketServer;
   httpServer: HttpServer;
   httpServers?: HttpServer[];
@@ -105,9 +106,6 @@ export function createGatewayCloseHandler(params: {
     }
     params.clients.clear();
     await params.configReloader.stop().catch(() => {});
-    if (params.browserControl) {
-      await params.browserControl.stop().catch(() => {});
-    }
     await new Promise<void>((resolve) => params.wss.close(() => resolve()));
     const servers =
       params.httpServers && params.httpServers.length > 0

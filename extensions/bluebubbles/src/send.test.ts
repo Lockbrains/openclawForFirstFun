@@ -371,9 +371,9 @@ describe("send", () => {
     });
 
     it("throws when text becomes empty after markdown stripping", async () => {
-      // Edge case: input like "***" or "---" passes initial check but becomes empty after stripMarkdown
+      // Edge case: "** **" passes initial trim check but becomes empty after stripMarkdown (bold with only spaces)
       await expect(
-        sendMessageBlueBubbles("+15551234567", "***", {
+        sendMessageBlueBubbles("+15551234567", "** **", {
           serverUrl: "http://localhost:1234",
           password: "test",
         }),

@@ -1,10 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { OpenClawConfig } from "../../config/config.js";
-import { signalOutbound } from "../../channels/plugins/outbound/signal.js";
-import { telegramOutbound } from "../../channels/plugins/outbound/telegram.js";
-import { whatsappOutbound } from "../../channels/plugins/outbound/whatsapp.js";
+import type { FirstClawConfig } from "../../config/config.js";
 import { setActivePluginRegistry } from "../../plugins/runtime.js";
-import { markdownToSignalTextChunks } from "../../signal/format.js";
 import {
   createIMessageTestPlugin,
   createOutboundTestPlugin,
@@ -35,167 +31,6 @@ describe("deliverOutboundPayloads", () => {
   afterEach(() => {
     setActivePluginRegistry(emptyRegistry);
   });
-  it("chunks telegram markdown and passes through accountId", async () => {
-    const sendTelegram = vi.fn().mockResolvedValue({ messageId: "m1", chatId: "c1" });
-    const cfg: OpenClawConfig = {
-      channels: { telegram: { botToken: "tok-1", textChunkLimit: 2 } },
-    };
-    const prevTelegramToken = process.env.TELEGRAM_BOT_TOKEN;
-    process.env.TELEGRAM_BOT_TOKEN = "";
-    try {
-      const results = await deliverOutboundPayloads({
-        cfg,
-        channel: "telegram",
-        to: "123",
-        payloads: [{ text: "abcd" }],
-        deps: { sendTelegram },
-      });
-
-      expect(sendTelegram).toHaveBeenCalledTimes(2);
-      for (const call of sendTelegram.mock.calls) {
-        expect(call[2]).toEqual(
-          expect.objectContaining({ accountId: undefined, verbose: false, textMode: "html" }),
-        );
-      }
-      expect(results).toHaveLength(2);
-      expect(results[0]).toMatchObject({ channel: "telegram", chatId: "c1" });
-    } finally {
-      if (prevTelegramToken === undefined) {
-        delete process.env.TELEGRAM_BOT_TOKEN;
-      } else {
-        process.env.TELEGRAM_BOT_TOKEN = prevTelegramToken;
-      }
-    }
-  });
-
-  it("passes explicit accountId to sendTelegram", async () => {
-    const sendTelegram = vi.fn().mockResolvedValue({ messageId: "m1", chatId: "c1" });
-    const cfg: OpenClawConfig = {
-      channels: { telegram: { botToken: "tok-1", textChunkLimit: 2 } },
-    };
-
-    await deliverOutboundPayloads({
-      cfg,
-      channel: "telegram",
-      to: "123",
-      accountId: "default",
-      payloads: [{ text: "hi" }],
-      deps: { sendTelegram },
-    });
-
-    expect(sendTelegram).toHaveBeenCalledWith(
-      "123",
-      "hi",
-      expect.objectContaining({ accountId: "default", verbose: false, textMode: "html" }),
-    );
-  });
-
-  it("uses signal media maxBytes from config", async () => {
-    const sendSignal = vi.fn().mockResolvedValue({ messageId: "s1", timestamp: 123 });
-    const cfg: OpenClawConfig = { channels: { signal: { mediaMaxMb: 2 } } };
-
-    const results = await deliverOutboundPayloads({
-      cfg,
-      channel: "signal",
-      to: "+1555",
-      payloads: [{ text: "hi", mediaUrl: "https://x.test/a.jpg" }],
-      deps: { sendSignal },
-    });
-
-    expect(sendSignal).toHaveBeenCalledWith(
-      "+1555",
-      "hi",
-      expect.objectContaining({
-        mediaUrl: "https://x.test/a.jpg",
-        maxBytes: 2 * 1024 * 1024,
-        textMode: "plain",
-        textStyles: [],
-      }),
-    );
-    expect(results[0]).toMatchObject({ channel: "signal", messageId: "s1" });
-  });
-
-  it("chunks Signal markdown using the format-first chunker", async () => {
-    const sendSignal = vi.fn().mockResolvedValue({ messageId: "s1", timestamp: 123 });
-    const cfg: OpenClawConfig = {
-      channels: { signal: { textChunkLimit: 20 } },
-    };
-    const text = `Intro\\n\\n\`\`\`\`md\\n${"y".repeat(60)}\\n\`\`\`\\n\\nOutro`;
-    const expectedChunks = markdownToSignalTextChunks(text, 20);
-
-    await deliverOutboundPayloads({
-      cfg,
-      channel: "signal",
-      to: "+1555",
-      payloads: [{ text }],
-      deps: { sendSignal },
-    });
-
-    expect(sendSignal).toHaveBeenCalledTimes(expectedChunks.length);
-    expectedChunks.forEach((chunk, index) => {
-      expect(sendSignal).toHaveBeenNthCalledWith(
-        index + 1,
-        "+1555",
-        chunk.text,
-        expect.objectContaining({
-          accountId: undefined,
-          textMode: "plain",
-          textStyles: chunk.styles,
-        }),
-      );
-    });
-  });
-
-  it("chunks WhatsApp text and returns all results", async () => {
-    const sendWhatsApp = vi
-      .fn()
-      .mockResolvedValueOnce({ messageId: "w1", toJid: "jid" })
-      .mockResolvedValueOnce({ messageId: "w2", toJid: "jid" });
-    const cfg: OpenClawConfig = {
-      channels: { whatsapp: { textChunkLimit: 2 } },
-    };
-
-    const results = await deliverOutboundPayloads({
-      cfg,
-      channel: "whatsapp",
-      to: "+1555",
-      payloads: [{ text: "abcd" }],
-      deps: { sendWhatsApp },
-    });
-
-    expect(sendWhatsApp).toHaveBeenCalledTimes(2);
-    expect(results.map((r) => r.messageId)).toEqual(["w1", "w2"]);
-  });
-
-  it("respects newline chunk mode for WhatsApp", async () => {
-    const sendWhatsApp = vi.fn().mockResolvedValue({ messageId: "w1", toJid: "jid" });
-    const cfg: OpenClawConfig = {
-      channels: { whatsapp: { textChunkLimit: 4000, chunkMode: "newline" } },
-    };
-
-    await deliverOutboundPayloads({
-      cfg,
-      channel: "whatsapp",
-      to: "+1555",
-      payloads: [{ text: "Line one\n\nLine two" }],
-      deps: { sendWhatsApp },
-    });
-
-    expect(sendWhatsApp).toHaveBeenCalledTimes(2);
-    expect(sendWhatsApp).toHaveBeenNthCalledWith(
-      1,
-      "+1555",
-      "Line one",
-      expect.objectContaining({ verbose: false }),
-    );
-    expect(sendWhatsApp).toHaveBeenNthCalledWith(
-      2,
-      "+1555",
-      "Line two",
-      expect.objectContaining({ verbose: false }),
-    );
-  });
-
   it("preserves fenced blocks for markdown chunkers in newline mode", async () => {
     const chunker = vi.fn((text: string) => (text ? [text] : []));
     const sendText = vi.fn().mockImplementation(async ({ text }: { text: string }) => ({
@@ -228,7 +63,7 @@ describe("deliverOutboundPayloads", () => {
       ]),
     );
 
-    const cfg: OpenClawConfig = {
+    const cfg: FirstClawConfig = {
       channels: { matrix: { textChunkLimit: 4000, chunkMode: "newline" } },
     };
     const text = "```js\nconst a = 1;\nconst b = 2;\n```\nAfter";
@@ -255,7 +90,7 @@ describe("deliverOutboundPayloads", () => {
         },
       ]),
     );
-    const cfg: OpenClawConfig = {
+    const cfg: FirstClawConfig = {
       agents: { defaults: { mediaMaxMb: 3 } },
     };
 
@@ -287,39 +122,39 @@ describe("deliverOutboundPayloads", () => {
   });
 
   it("continues on errors when bestEffort is enabled", async () => {
-    const sendWhatsApp = vi
+    const sendIMessage = vi
       .fn()
       .mockRejectedValueOnce(new Error("fail"))
-      .mockResolvedValueOnce({ messageId: "w2", toJid: "jid" });
+      .mockResolvedValueOnce({ messageId: "i2" });
     const onError = vi.fn();
-    const cfg: OpenClawConfig = {};
+    const cfg: FirstClawConfig = {};
 
     const results = await deliverOutboundPayloads({
       cfg,
-      channel: "whatsapp",
-      to: "+1555",
+      channel: "imessage",
+      to: "chat_id:42",
       payloads: [{ text: "a" }, { text: "b" }],
-      deps: { sendWhatsApp },
+      deps: { sendIMessage },
       bestEffort: true,
       onError,
     });
 
-    expect(sendWhatsApp).toHaveBeenCalledTimes(2);
+    expect(sendIMessage).toHaveBeenCalledTimes(2);
     expect(onError).toHaveBeenCalledTimes(1);
-    expect(results).toEqual([{ channel: "whatsapp", messageId: "w2", toJid: "jid" }]);
+    expect(results).toEqual([{ channel: "imessage", messageId: "i2" }]);
   });
 
   it("passes normalized payload to onError", async () => {
-    const sendWhatsApp = vi.fn().mockRejectedValue(new Error("boom"));
+    const sendIMessage = vi.fn().mockRejectedValue(new Error("boom"));
     const onError = vi.fn();
-    const cfg: OpenClawConfig = {};
+    const cfg: FirstClawConfig = {};
 
     await deliverOutboundPayloads({
       cfg,
-      channel: "whatsapp",
-      to: "+1555",
+      channel: "imessage",
+      to: "chat_id:42",
       payloads: [{ text: "hi", mediaUrl: "https://x.test/a.jpg" }],
-      deps: { sendWhatsApp },
+      deps: { sendIMessage },
       bestEffort: true,
       onError,
     });
@@ -332,18 +167,16 @@ describe("deliverOutboundPayloads", () => {
   });
 
   it("mirrors delivered output when mirror options are provided", async () => {
-    const sendTelegram = vi.fn().mockResolvedValue({ messageId: "m1", chatId: "c1" });
-    const cfg: OpenClawConfig = {
-      channels: { telegram: { botToken: "tok-1", textChunkLimit: 2 } },
-    };
+    const sendIMessage = vi.fn().mockResolvedValue({ messageId: "i1" });
+    const cfg: FirstClawConfig = {};
     mocks.appendAssistantMessageToSessionTranscript.mockClear();
 
     await deliverOutboundPayloads({
       cfg,
-      channel: "telegram",
-      to: "123",
+      channel: "imessage",
+      to: "chat_id:42",
       payloads: [{ text: "caption", mediaUrl: "https://example.com/files/report.pdf?sig=1" }],
-      deps: { sendTelegram },
+      deps: { sendIMessage },
       mirror: {
         sessionKey: "agent:main:main",
         text: "caption",
@@ -359,21 +192,6 @@ describe("deliverOutboundPayloads", () => {
 
 const emptyRegistry = createTestRegistry([]);
 const defaultRegistry = createTestRegistry([
-  {
-    pluginId: "telegram",
-    plugin: createOutboundTestPlugin({ id: "telegram", outbound: telegramOutbound }),
-    source: "test",
-  },
-  {
-    pluginId: "signal",
-    plugin: createOutboundTestPlugin({ id: "signal", outbound: signalOutbound }),
-    source: "test",
-  },
-  {
-    pluginId: "whatsapp",
-    plugin: createOutboundTestPlugin({ id: "whatsapp", outbound: whatsappOutbound }),
-    source: "test",
-  },
   {
     pluginId: "imessage",
     plugin: createIMessageTestPlugin(),

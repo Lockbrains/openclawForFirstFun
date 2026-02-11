@@ -11,7 +11,7 @@ const tempDirs: string[] = [];
 const EMPTY_PLUGIN_SCHEMA = { type: "object", additionalProperties: false, properties: {} };
 
 function makeTempDir() {
-  const dir = path.join(os.tmpdir(), `openclaw-plugin-tools-${randomUUID()}`);
+  const dir = path.join(os.tmpdir(), `firstclaw-plugin-tools-${randomUUID()}`);
   fs.mkdirSync(dir, { recursive: true });
   tempDirs.push(dir);
   return dir;
@@ -22,7 +22,7 @@ function writePlugin(params: { id: string; body: string }): TempPlugin {
   const file = path.join(dir, `${params.id}.js`);
   fs.writeFileSync(file, params.body, "utf-8");
   fs.writeFileSync(
-    path.join(dir, "openclaw.plugin.json"),
+    path.join(dir, "firstclaw.plugin.json"),
     JSON.stringify(
       {
         id: params.id,
@@ -80,7 +80,7 @@ export default { register(api) {
   });
 
   it("allows optional tools by name", () => {
-    const plugin = writePlugin({ id: "optional-demo", body: pluginBody });
+    const plugin = writePlugin({ id: "feishu", body: pluginBody });
     const tools = resolvePluginTools({
       context: {
         config: {
@@ -97,7 +97,7 @@ export default { register(api) {
   });
 
   it("allows optional tools via plugin groups", () => {
-    const plugin = writePlugin({ id: "optional-demo", body: pluginBody });
+    const plugin = writePlugin({ id: "feishu", body: pluginBody });
     const toolsAll = resolvePluginTools({
       context: {
         config: {
@@ -122,7 +122,7 @@ export default { register(api) {
         },
         workspaceDir: plugin.dir,
       },
-      toolAllowlist: ["optional-demo"],
+      toolAllowlist: ["feishu"],
     });
     expect(toolsPlugin.map((tool) => tool.name)).toContain("optional_tool");
   });
@@ -147,7 +147,7 @@ export default { register(api) {
 
   it("skips conflicting tool names but keeps other tools", () => {
     const plugin = writePlugin({
-      id: "multi",
+      id: "llm-task",
       body: `
 export default { register(api) {
   api.registerTool({

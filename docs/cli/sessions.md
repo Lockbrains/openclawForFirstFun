@@ -1,16 +1,16 @@
 ---
-summary: "CLI reference for `openclaw sessions` (list stored sessions + usage)"
+summary: "CLI reference for `firstclaw sessions` (list stored sessions + usage)"
 read_when:
   - You want to list stored sessions and see recent activity
 title: "sessions"
 ---
 
-# `openclaw sessions`
+# `firstclaw sessions`
 
 List stored conversation sessions.
 
 ```bash
-openclaw sessions
-openclaw sessions --active 120
-openclaw sessions --json
+firstclaw sessions
+firstclaw sessions --active 120
+firstclaw sessions --json
 ```

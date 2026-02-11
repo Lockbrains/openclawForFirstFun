@@ -1,4 +1,4 @@
-import type { OpenClawApp } from "./app.ts";
+import type { FirstClawApp } from "./app.ts";
 import type { NostrProfile } from "./types.ts";
 import {
   loadChannels,
@@ -9,28 +9,28 @@ import {
 import { loadConfig, saveConfig } from "./controllers/config.ts";
 import { createNostrProfileFormState } from "./views/channels.nostr-profile-form.ts";
 
-export async function handleWhatsAppStart(host: OpenClawApp, force: boolean) {
+export async function handleWhatsAppStart(host: FirstClawApp, force: boolean) {
   await startWhatsAppLogin(host, force);
   await loadChannels(host, true);
 }
 
-export async function handleWhatsAppWait(host: OpenClawApp) {
+export async function handleWhatsAppWait(host: FirstClawApp) {
   await waitWhatsAppLogin(host);
   await loadChannels(host, true);
 }
 
-export async function handleWhatsAppLogout(host: OpenClawApp) {
+export async function handleWhatsAppLogout(host: FirstClawApp) {
   await logoutWhatsApp(host);
   await loadChannels(host, true);
 }
 
-export async function handleChannelConfigSave(host: OpenClawApp) {
+export async function handleChannelConfigSave(host: FirstClawApp) {
   await saveConfig(host);
   await loadConfig(host);
   await loadChannels(host, true);
 }
 
-export async function handleChannelConfigReload(host: OpenClawApp) {
+export async function handleChannelConfigReload(host: FirstClawApp) {
   await loadConfig(host);
   await loadChannels(host, true);
 }
@@ -57,7 +57,7 @@ function parseValidationErrors(details: unknown): Record<string, string> {
   return errors;
 }
 
-function resolveNostrAccountId(host: OpenClawApp): string {
+function resolveNostrAccountId(host: FirstClawApp): string {
   const accounts = host.channelsSnapshot?.channelAccounts?.nostr ?? [];
   return accounts[0]?.accountId ?? host.nostrProfileAccountId ?? "default";
 }
@@ -67,7 +67,7 @@ function buildNostrProfileUrl(accountId: string, suffix = ""): string {
 }
 
 export function handleNostrProfileEdit(
-  host: OpenClawApp,
+  host: FirstClawApp,
   accountId: string,
   profile: NostrProfile | null,
 ) {
@@ -75,13 +75,13 @@ export function handleNostrProfileEdit(
   host.nostrProfileFormState = createNostrProfileFormState(profile ?? undefined);
 }
 
-export function handleNostrProfileCancel(host: OpenClawApp) {
+export function handleNostrProfileCancel(host: FirstClawApp) {
   host.nostrProfileFormState = null;
   host.nostrProfileAccountId = null;
 }
 
 export function handleNostrProfileFieldChange(
-  host: OpenClawApp,
+  host: FirstClawApp,
   field: keyof NostrProfile,
   value: string,
 ) {
@@ -102,7 +102,7 @@ export function handleNostrProfileFieldChange(
   };
 }
 
-export function handleNostrProfileToggleAdvanced(host: OpenClawApp) {
+export function handleNostrProfileToggleAdvanced(host: FirstClawApp) {
   const state = host.nostrProfileFormState;
   if (!state) {
     return;
@@ -113,7 +113,7 @@ export function handleNostrProfileToggleAdvanced(host: OpenClawApp) {
   };
 }
 
-export async function handleNostrProfileSave(host: OpenClawApp) {
+export async function handleNostrProfileSave(host: FirstClawApp) {
   const state = host.nostrProfileFormState;
   if (!state || state.saving) {
     return;
@@ -184,7 +184,7 @@ export async function handleNostrProfileSave(host: OpenClawApp) {
   }
 }
 
-export async function handleNostrProfileImport(host: OpenClawApp) {
+export async function handleNostrProfileImport(host: FirstClawApp) {
   const state = host.nostrProfileFormState;
   if (!state || state.importing) {
     return;

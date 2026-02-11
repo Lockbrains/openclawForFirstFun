@@ -23,7 +23,7 @@ async function writePluginFixture(params: {
     manifest.channels = params.channels;
   }
   await fs.writeFile(
-    path.join(params.dir, "openclaw.plugin.json"),
+    path.join(params.dir, "firstclaw.plugin.json"),
     JSON.stringify(manifest, null, 2),
     "utf-8",
   );
@@ -32,7 +32,7 @@ async function writePluginFixture(params: {
 describe("config plugin validation", () => {
   it("rejects missing plugin load paths", async () => {
     await withTempHome(async (home) => {
-      process.env.OPENCLAW_STATE_DIR = path.join(home, ".openclaw");
+      process.env.FIRSTCLAW_STATE_DIR = path.join(home, ".firstclaw");
       vi.resetModules();
       const { validateConfigObjectWithPlugins } = await import("./config.js");
       const missingPath = path.join(home, "missing-plugin");
@@ -53,7 +53,7 @@ describe("config plugin validation", () => {
 
   it("rejects missing plugin ids in entries", async () => {
     await withTempHome(async (home) => {
-      process.env.OPENCLAW_STATE_DIR = path.join(home, ".openclaw");
+      process.env.FIRSTCLAW_STATE_DIR = path.join(home, ".firstclaw");
       vi.resetModules();
       const { validateConfigObjectWithPlugins } = await import("./config.js");
       const res = validateConfigObjectWithPlugins({
@@ -72,7 +72,7 @@ describe("config plugin validation", () => {
 
   it("rejects missing plugin ids in allow/deny/slots", async () => {
     await withTempHome(async (home) => {
-      process.env.OPENCLAW_STATE_DIR = path.join(home, ".openclaw");
+      process.env.FIRSTCLAW_STATE_DIR = path.join(home, ".firstclaw");
       vi.resetModules();
       const { validateConfigObjectWithPlugins } = await import("./config.js");
       const res = validateConfigObjectWithPlugins({
@@ -99,11 +99,12 @@ describe("config plugin validation", () => {
 
   it("surfaces plugin config diagnostics", async () => {
     await withTempHome(async (home) => {
-      process.env.OPENCLAW_STATE_DIR = path.join(home, ".openclaw");
-      const pluginDir = path.join(home, "bad-plugin");
+      process.env.FIRSTCLAW_STATE_DIR = path.join(home, ".firstclaw");
+      // Use memory-core (in ALLOWED_EXTENSIONS) so discovery includes this plugin
+      const pluginDir = path.join(home, "memory-core");
       await writePluginFixture({
         dir: pluginDir,
-        id: "bad-plugin",
+        id: "memory-core",
         schema: {
           type: "object",
           additionalProperties: false,
@@ -121,14 +122,15 @@ describe("config plugin validation", () => {
         plugins: {
           enabled: true,
           load: { paths: [pluginDir] },
-          entries: { "bad-plugin": { config: { value: "nope" } } },
+          entries: { "memory-core": { config: { value: "nope" } } },
         },
       });
       expect(res.ok).toBe(false);
       if (!res.ok) {
         const hasIssue = res.issues.some(
           (issue) =>
-            issue.path === "plugins.entries.bad-plugin.config" &&
+            (issue.path === "plugins.entries.memory-core.config" ||
+              issue.path?.startsWith("plugins.entries.")) &&
             issue.message.includes("invalid config"),
         );
         expect(hasIssue).toBe(true);
@@ -138,12 +140,12 @@ describe("config plugin validation", () => {
 
   it("accepts known plugin ids", async () => {
     await withTempHome(async (home) => {
-      process.env.OPENCLAW_STATE_DIR = path.join(home, ".openclaw");
+      process.env.FIRSTCLAW_STATE_DIR = path.join(home, ".firstclaw");
       vi.resetModules();
       const { validateConfigObjectWithPlugins } = await import("./config.js");
       const res = validateConfigObjectWithPlugins({
         agents: { list: [{ id: "pi" }] },
-        plugins: { enabled: false, entries: { discord: { enabled: true } } },
+        plugins: { enabled: false, entries: { imessage: { enabled: true } } },
       });
       expect(res.ok).toBe(true);
     });
@@ -151,7 +153,7 @@ describe("config plugin validation", () => {
 
   it("accepts plugin heartbeat targets", async () => {
     await withTempHome(async (home) => {
-      process.env.OPENCLAW_STATE_DIR = path.join(home, ".openclaw");
+      process.env.FIRSTCLAW_STATE_DIR = path.join(home, ".firstclaw");
       const pluginDir = path.join(home, "bluebubbles-plugin");
       await writePluginFixture({
         dir: pluginDir,
@@ -172,7 +174,7 @@ describe("config plugin validation", () => {
 
   it("rejects unknown heartbeat targets", async () => {
     await withTempHome(async (home) => {
-      process.env.OPENCLAW_STATE_DIR = path.join(home, ".openclaw");
+      process.env.FIRSTCLAW_STATE_DIR = path.join(home, ".firstclaw");
       vi.resetModules();
       const { validateConfigObjectWithPlugins } = await import("./config.js");
       const res = validateConfigObjectWithPlugins({

@@ -3,16 +3,16 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { loadOpenClawPlugins } from "./loader.js";
+import { loadFirstClawPlugins } from "./loader.js";
 
 type TempPlugin = { dir: string; file: string; id: string };
 
 const tempDirs: string[] = [];
-const prevBundledDir = process.env.OPENCLAW_BUNDLED_PLUGINS_DIR;
+const prevBundledDir = process.env.FIRSTCLAW_BUNDLED_PLUGINS_DIR;
 const EMPTY_PLUGIN_SCHEMA = { type: "object", additionalProperties: false, properties: {} };
 
 function makeTempDir() {
-  const dir = path.join(os.tmpdir(), `openclaw-plugin-${randomUUID()}`);
+  const dir = path.join(os.tmpdir(), `firstclaw-plugin-${randomUUID()}`);
   fs.mkdirSync(dir, { recursive: true });
   tempDirs.push(dir);
   return dir;
@@ -29,7 +29,7 @@ function writePlugin(params: {
   const file = path.join(dir, filename);
   fs.writeFileSync(file, params.body, "utf-8");
   fs.writeFileSync(
-    path.join(dir, "openclaw.plugin.json"),
+    path.join(dir, "firstclaw.plugin.json"),
     JSON.stringify(
       {
         id: params.id,
@@ -52,65 +52,65 @@ afterEach(() => {
     }
   }
   if (prevBundledDir === undefined) {
-    delete process.env.OPENCLAW_BUNDLED_PLUGINS_DIR;
+    delete process.env.FIRSTCLAW_BUNDLED_PLUGINS_DIR;
   } else {
-    process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = prevBundledDir;
+    process.env.FIRSTCLAW_BUNDLED_PLUGINS_DIR = prevBundledDir;
   }
 });
 
-describe("loadOpenClawPlugins", () => {
+describe("loadFirstClawPlugins", () => {
   it("disables bundled plugins by default", () => {
     const bundledDir = makeTempDir();
     writePlugin({
-      id: "bundled",
-      body: `export default { id: "bundled", register() {} };`,
+      id: "feishu",
+      body: `export default { id: "feishu", register() {} };`,
       dir: bundledDir,
-      filename: "bundled.ts",
+      filename: "feishu.ts",
     });
-    process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = bundledDir;
+    process.env.FIRSTCLAW_BUNDLED_PLUGINS_DIR = bundledDir;
 
-    const registry = loadOpenClawPlugins({
+    const registry = loadFirstClawPlugins({
       cache: false,
       config: {
         plugins: {
-          allow: ["bundled"],
+          allow: ["feishu"],
         },
       },
     });
 
-    const bundled = registry.plugins.find((entry) => entry.id === "bundled");
+    const bundled = registry.plugins.find((entry) => entry.id === "feishu");
     expect(bundled?.status).toBe("disabled");
 
-    const enabledRegistry = loadOpenClawPlugins({
+    const enabledRegistry = loadFirstClawPlugins({
       cache: false,
       config: {
         plugins: {
-          allow: ["bundled"],
+          allow: ["feishu"],
           entries: {
-            bundled: { enabled: true },
+            feishu: { enabled: true },
           },
         },
       },
     });
 
-    const enabled = enabledRegistry.plugins.find((entry) => entry.id === "bundled");
+    const enabled = enabledRegistry.plugins.find((entry) => entry.id === "feishu");
     expect(enabled?.status).toBe("loaded");
   });
 
-  it("loads bundled telegram plugin when enabled", () => {
+  it("loads bundled imessage plugin when enabled", () => {
     const bundledDir = makeTempDir();
     writePlugin({
-      id: "telegram",
-      body: `export default { id: "telegram", register(api) {
+      id: "imessage",
+      body: `export default { id: "imessage", register(api) {
   api.registerChannel({
     plugin: {
-      id: "telegram",
+      id: "imessage",
       meta: {
-        id: "telegram",
-        label: "Telegram",
-        selectionLabel: "Telegram",
-        docsPath: "/channels/telegram",
-        blurb: "telegram channel"
+        id: "imessage",
+        label: "iMessage",
+        selectionLabel: "iMessage",
+        docsPath: "/channels/imessage",
+        blurb: "imessage channel"
       },
       capabilities: { chatTypes: ["direct"] },
       config: {
@@ -122,25 +122,25 @@ describe("loadOpenClawPlugins", () => {
   });
 } };`,
       dir: bundledDir,
-      filename: "telegram.ts",
+      filename: "imessage.ts",
     });
-    process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = bundledDir;
+    process.env.FIRSTCLAW_BUNDLED_PLUGINS_DIR = bundledDir;
 
-    const registry = loadOpenClawPlugins({
+    const registry = loadFirstClawPlugins({
       cache: false,
       config: {
         plugins: {
-          allow: ["telegram"],
+          allow: ["imessage"],
           entries: {
-            telegram: { enabled: true },
+            imessage: { enabled: true },
           },
         },
       },
     });
 
-    const telegram = registry.plugins.find((entry) => entry.id === "telegram");
-    expect(telegram?.status).toBe("loaded");
-    expect(registry.channels.some((entry) => entry.plugin.id === "telegram")).toBe(true);
+    const imessage = registry.plugins.find((entry) => entry.id === "imessage");
+    expect(imessage?.status).toBe("loaded");
+    expect(registry.channels.some((entry) => entry.plugin.id === "imessage")).toBe(true);
   });
 
   it("enables bundled memory plugin when selected by slot", () => {
@@ -151,9 +151,9 @@ describe("loadOpenClawPlugins", () => {
       dir: bundledDir,
       filename: "memory-core.ts",
     });
-    process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = bundledDir;
+    process.env.FIRSTCLAW_BUNDLED_PLUGINS_DIR = bundledDir;
 
-    const registry = loadOpenClawPlugins({
+    const registry = loadFirstClawPlugins({
       cache: false,
       config: {
         plugins: {
@@ -176,10 +176,10 @@ describe("loadOpenClawPlugins", () => {
     fs.writeFileSync(
       path.join(pluginDir, "package.json"),
       JSON.stringify({
-        name: "@openclaw/memory-core",
+        name: "@firstclaw/memory-core",
         version: "1.2.3",
         description: "Memory plugin package",
-        openclaw: { extensions: ["./index.ts"] },
+        firstclaw: { extensions: ["./index.ts"] },
       }),
       "utf-8",
     );
@@ -190,9 +190,9 @@ describe("loadOpenClawPlugins", () => {
       filename: "index.ts",
     });
 
-    process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = bundledDir;
+    process.env.FIRSTCLAW_BUNDLED_PLUGINS_DIR = bundledDir;
 
-    const registry = loadOpenClawPlugins({
+    const registry = loadFirstClawPlugins({
       cache: false,
       config: {
         plugins: {
@@ -210,66 +210,66 @@ describe("loadOpenClawPlugins", () => {
     expect(memory?.version).toBe("1.2.3");
   });
   it("loads plugins from config paths", () => {
-    process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = "/nonexistent/bundled/plugins";
+    process.env.FIRSTCLAW_BUNDLED_PLUGINS_DIR = "/nonexistent/bundled/plugins";
     const plugin = writePlugin({
-      id: "allowed",
-      body: `export default { id: "allowed", register(api) { api.registerGatewayMethod("allowed.ping", ({ respond }) => respond(true, { ok: true })); } };`,
+      id: "feishu",
+      body: `export default { id: "feishu", register(api) { api.registerGatewayMethod("feishu.ping", ({ respond }) => respond(true, { ok: true })); } };`,
     });
 
-    const registry = loadOpenClawPlugins({
+    const registry = loadFirstClawPlugins({
       cache: false,
       workspaceDir: plugin.dir,
       config: {
         plugins: {
           load: { paths: [plugin.file] },
-          allow: ["allowed"],
+          allow: ["feishu"],
         },
       },
     });
 
-    const loaded = registry.plugins.find((entry) => entry.id === "allowed");
+    const loaded = registry.plugins.find((entry) => entry.id === "feishu");
     expect(loaded?.status).toBe("loaded");
-    expect(Object.keys(registry.gatewayHandlers)).toContain("allowed.ping");
+    expect(Object.keys(registry.gatewayHandlers)).toContain("feishu.ping");
   });
 
   it("denylist disables plugins even if allowed", () => {
-    process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = "/nonexistent/bundled/plugins";
+    process.env.FIRSTCLAW_BUNDLED_PLUGINS_DIR = "/nonexistent/bundled/plugins";
     const plugin = writePlugin({
-      id: "blocked",
-      body: `export default { id: "blocked", register() {} };`,
+      id: "imessage",
+      body: `export default { id: "imessage", register() {} };`,
     });
 
-    const registry = loadOpenClawPlugins({
+    const registry = loadFirstClawPlugins({
       cache: false,
       workspaceDir: plugin.dir,
       config: {
         plugins: {
           load: { paths: [plugin.file] },
-          allow: ["blocked"],
-          deny: ["blocked"],
+          allow: ["imessage"],
+          deny: ["imessage"],
         },
       },
     });
 
-    const blocked = registry.plugins.find((entry) => entry.id === "blocked");
+    const blocked = registry.plugins.find((entry) => entry.id === "imessage");
     expect(blocked?.status).toBe("disabled");
   });
 
   it("fails fast on invalid plugin config", () => {
-    process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = "/nonexistent/bundled/plugins";
+    process.env.FIRSTCLAW_BUNDLED_PLUGINS_DIR = "/nonexistent/bundled/plugins";
     const plugin = writePlugin({
-      id: "configurable",
-      body: `export default { id: "configurable", register() {} };`,
+      id: "llm-task",
+      body: `export default { id: "llm-task", register() {} };`,
     });
 
-    const registry = loadOpenClawPlugins({
+    const registry = loadFirstClawPlugins({
       cache: false,
       workspaceDir: plugin.dir,
       config: {
         plugins: {
           load: { paths: [plugin.file] },
           entries: {
-            configurable: {
+            "llm-task": {
               config: "nope" as unknown as Record<string, unknown>,
             },
           },
@@ -277,25 +277,25 @@ describe("loadOpenClawPlugins", () => {
       },
     });
 
-    const configurable = registry.plugins.find((entry) => entry.id === "configurable");
+    const configurable = registry.plugins.find((entry) => entry.id === "llm-task");
     expect(configurable?.status).toBe("error");
     expect(registry.diagnostics.some((d) => d.level === "error")).toBe(true);
   });
 
   it("registers channel plugins", () => {
-    process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = "/nonexistent/bundled/plugins";
+    process.env.FIRSTCLAW_BUNDLED_PLUGINS_DIR = "/nonexistent/bundled/plugins";
     const plugin = writePlugin({
-      id: "channel-demo",
-      body: `export default { id: "channel-demo", register(api) {
+      id: "feishu",
+      body: `export default { id: "feishu", register(api) {
   api.registerChannel({
     plugin: {
-      id: "demo",
+      id: "feishu",
       meta: {
-        id: "demo",
-        label: "Demo",
-        selectionLabel: "Demo",
-        docsPath: "/channels/demo",
-        blurb: "demo channel"
+        id: "feishu",
+        label: "Feishu",
+        selectionLabel: "Feishu",
+        docsPath: "/channels/feishu",
+        blurb: "feishu channel"
       },
       capabilities: { chatTypes: ["direct"] },
       config: {
@@ -308,132 +308,134 @@ describe("loadOpenClawPlugins", () => {
 } };`,
     });
 
-    const registry = loadOpenClawPlugins({
+    const registry = loadFirstClawPlugins({
       cache: false,
       workspaceDir: plugin.dir,
       config: {
         plugins: {
           load: { paths: [plugin.file] },
-          allow: ["channel-demo"],
+          allow: ["feishu"],
         },
       },
     });
 
-    const channel = registry.channels.find((entry) => entry.plugin.id === "demo");
+    const channel = registry.channels.find((entry) => entry.plugin.id === "feishu");
     expect(channel).toBeDefined();
   });
 
   it("registers http handlers", () => {
-    process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = "/nonexistent/bundled/plugins";
+    process.env.FIRSTCLAW_BUNDLED_PLUGINS_DIR = "/nonexistent/bundled/plugins";
     const plugin = writePlugin({
-      id: "http-demo",
-      body: `export default { id: "http-demo", register(api) {
+      id: "diagnostics-otel",
+      body: `export default { id: "diagnostics-otel", register(api) {
   api.registerHttpHandler(async () => false);
 } };`,
     });
 
-    const registry = loadOpenClawPlugins({
+    const registry = loadFirstClawPlugins({
       cache: false,
       workspaceDir: plugin.dir,
       config: {
         plugins: {
           load: { paths: [plugin.file] },
-          allow: ["http-demo"],
+          allow: ["diagnostics-otel"],
         },
       },
     });
 
-    const handler = registry.httpHandlers.find((entry) => entry.pluginId === "http-demo");
+    const handler = registry.httpHandlers.find((entry) => entry.pluginId === "diagnostics-otel");
     expect(handler).toBeDefined();
-    const httpPlugin = registry.plugins.find((entry) => entry.id === "http-demo");
+    const httpPlugin = registry.plugins.find((entry) => entry.id === "diagnostics-otel");
     expect(httpPlugin?.httpHandlers).toBe(1);
   });
 
   it("registers http routes", () => {
-    process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = "/nonexistent/bundled/plugins";
+    process.env.FIRSTCLAW_BUNDLED_PLUGINS_DIR = "/nonexistent/bundled/plugins";
     const plugin = writePlugin({
-      id: "http-route-demo",
-      body: `export default { id: "http-route-demo", register(api) {
+      id: "lobster",
+      body: `export default { id: "lobster", register(api) {
   api.registerHttpRoute({ path: "/demo", handler: async (_req, res) => { res.statusCode = 200; res.end("ok"); } });
 } };`,
     });
 
-    const registry = loadOpenClawPlugins({
+    const registry = loadFirstClawPlugins({
       cache: false,
       workspaceDir: plugin.dir,
       config: {
         plugins: {
           load: { paths: [plugin.file] },
-          allow: ["http-route-demo"],
+          allow: ["lobster"],
         },
       },
     });
 
-    const route = registry.httpRoutes.find((entry) => entry.pluginId === "http-route-demo");
+    const route = registry.httpRoutes.find((entry) => entry.pluginId === "lobster");
     expect(route).toBeDefined();
     expect(route?.path).toBe("/demo");
-    const httpPlugin = registry.plugins.find((entry) => entry.id === "http-route-demo");
+    const httpPlugin = registry.plugins.find((entry) => entry.id === "lobster");
     expect(httpPlugin?.httpHandlers).toBe(1);
   });
 
   it("respects explicit disable in config", () => {
-    process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = "/nonexistent/bundled/plugins";
+    process.env.FIRSTCLAW_BUNDLED_PLUGINS_DIR = "/nonexistent/bundled/plugins";
     const plugin = writePlugin({
-      id: "config-disable",
-      body: `export default { id: "config-disable", register() {} };`,
+      id: "minimax-portal-auth",
+      body: `export default { id: "minimax-portal-auth", register() {} };`,
     });
 
-    const registry = loadOpenClawPlugins({
+    const registry = loadFirstClawPlugins({
       cache: false,
+      workspaceDir: plugin.dir,
       config: {
         plugins: {
           load: { paths: [plugin.file] },
+          allow: ["minimax-portal-auth"],
           entries: {
-            "config-disable": { enabled: false },
+            "minimax-portal-auth": { enabled: false },
           },
         },
       },
     });
 
-    const disabled = registry.plugins.find((entry) => entry.id === "config-disable");
+    const disabled = registry.plugins.find((entry) => entry.id === "minimax-portal-auth");
     expect(disabled?.status).toBe("disabled");
   });
 
   it("enforces memory slot selection", () => {
-    process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = "/nonexistent/bundled/plugins";
+    process.env.FIRSTCLAW_BUNDLED_PLUGINS_DIR = "/nonexistent/bundled/plugins";
     const memoryA = writePlugin({
-      id: "memory-a",
-      body: `export default { id: "memory-a", kind: "memory", register() {} };`,
+      id: "memory-core",
+      body: `export default { id: "memory-core", kind: "memory", register() {} };`,
     });
     const memoryB = writePlugin({
-      id: "memory-b",
-      body: `export default { id: "memory-b", kind: "memory", register() {} };`,
+      id: "memory-lancedb",
+      body: `export default { id: "memory-lancedb", kind: "memory", register() {} };`,
     });
 
-    const registry = loadOpenClawPlugins({
+    const registry = loadFirstClawPlugins({
       cache: false,
       config: {
         plugins: {
           load: { paths: [memoryA.file, memoryB.file] },
-          slots: { memory: "memory-b" },
+          slots: { memory: "memory-lancedb" },
         },
       },
     });
 
-    const a = registry.plugins.find((entry) => entry.id === "memory-a");
-    const b = registry.plugins.find((entry) => entry.id === "memory-b");
+    const a = registry.plugins.find((entry) => entry.id === "memory-core");
+    const b = registry.plugins.find((entry) => entry.id === "memory-lancedb");
     expect(b?.status).toBe("loaded");
     expect(a?.status).toBe("disabled");
   });
 
   it("disables memory plugins when slot is none", () => {
-    process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = "/nonexistent/bundled/plugins";
+    process.env.FIRSTCLAW_BUNDLED_PLUGINS_DIR = "/nonexistent/bundled/plugins";
     const memory = writePlugin({
-      id: "memory-off",
-      body: `export default { id: "memory-off", kind: "memory", register() {} };`,
+      id: "memory-core",
+      body: `export default { id: "memory-core", kind: "memory", register() {} };`,
     });
 
-    const registry = loadOpenClawPlugins({
+    const registry = loadFirstClawPlugins({
       cache: false,
       config: {
         plugins: {
@@ -443,38 +445,38 @@ describe("loadOpenClawPlugins", () => {
       },
     });
 
-    const entry = registry.plugins.find((item) => item.id === "memory-off");
+    const entry = registry.plugins.find((item) => item.id === "memory-core");
     expect(entry?.status).toBe("disabled");
   });
 
   it("prefers higher-precedence plugins with the same id", () => {
     const bundledDir = makeTempDir();
     writePlugin({
-      id: "shadow",
-      body: `export default { id: "shadow", register() {} };`,
+      id: "feishu",
+      body: `export default { id: "feishu", register() {} };`,
       dir: bundledDir,
-      filename: "shadow.js",
+      filename: "feishu.js",
     });
-    process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = bundledDir;
+    process.env.FIRSTCLAW_BUNDLED_PLUGINS_DIR = bundledDir;
 
     const override = writePlugin({
-      id: "shadow",
-      body: `export default { id: "shadow", register() {} };`,
+      id: "feishu",
+      body: `export default { id: "feishu", register() {} };`,
     });
 
-    const registry = loadOpenClawPlugins({
+    const registry = loadFirstClawPlugins({
       cache: false,
       config: {
         plugins: {
           load: { paths: [override.file] },
           entries: {
-            shadow: { enabled: true },
+            feishu: { enabled: true },
           },
         },
       },
     });
 
-    const entries = registry.plugins.filter((entry) => entry.id === "shadow");
+    const entries = registry.plugins.filter((entry) => entry.id === "feishu");
     const loaded = entries.find((entry) => entry.status === "loaded");
     const overridden = entries.find((entry) => entry.status === "disabled");
     expect(loaded?.origin).toBe("config");

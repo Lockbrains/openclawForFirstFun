@@ -4,12 +4,6 @@ import fs from "node:fs";
 import fsPromises from "node:fs/promises";
 import path from "node:path";
 import { resolveAgentConfig } from "../agents/agent-scope.js";
-import { resolveBrowserConfig } from "../browser/config.js";
-import {
-  createBrowserControlContext,
-  startBrowserControlServiceFromConfig,
-} from "../browser/control-service.js";
-import { createBrowserRouteDispatcher } from "../browser/routes/dispatcher.js";
 import { loadConfig } from "../config/config.js";
 import { GatewayClient } from "../gateway/client.js";
 import { loadOrCreateDeviceIdentity } from "../infra/device-identity.js";
@@ -40,7 +34,7 @@ import {
   type ExecHostRunResult,
 } from "../infra/exec-host.js";
 import { getMachineDisplayName } from "../infra/machine-name.js";
-import { ensureOpenClawCliOnPath } from "../infra/path-env.js";
+import { ensureFirstClawCliOnPath } from "../infra/path-env.js";
 import { detectMime } from "../media/mime.js";
 import { GATEWAY_CLIENT_MODES, GATEWAY_CLIENT_NAMES } from "../utils/message-channel.js";
 import { VERSION } from "../version.js";
@@ -159,9 +153,9 @@ const OUTPUT_EVENT_TAIL = 20_000;
 const DEFAULT_NODE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const BROWSER_PROXY_MAX_FILE_BYTES = 10 * 1024 * 1024;
 
-const execHostEnforced = process.env.OPENCLAW_NODE_EXEC_HOST?.trim().toLowerCase() === "app";
+const execHostEnforced = process.env.FIRSTCLAW_NODE_EXEC_HOST?.trim().toLowerCase() === "app";
 const execHostFallbackAllowed =
-  process.env.OPENCLAW_NODE_EXEC_FALLBACK?.trim().toLowerCase() !== "0";
+  process.env.FIRSTCLAW_NODE_EXEC_FALLBACK?.trim().toLowerCase() !== "0";
 
 const blockedEnvKeys = new Set([
   "NODE_OPTIONS",
@@ -248,32 +242,35 @@ function normalizeProfileAllowlist(raw?: string[]): string[] {
   return Array.isArray(raw) ? raw.map((entry) => entry.trim()).filter(Boolean) : [];
 }
 
-function resolveBrowserProxyConfig() {
-  const cfg = loadConfig();
-  const proxy = cfg.nodeHost?.browserProxy;
-  const allowProfiles = normalizeProfileAllowlist(proxy?.allowProfiles);
-  const enabled = proxy?.enabled !== false;
-  return { enabled, allowProfiles };
+function resolveBrowserConfig(
+  _browser: unknown,
+  _cfg: unknown,
+): {
+  enabled: boolean;
+  defaultProfile?: string;
+  profiles?: Record<string, unknown>;
+} {
+  return { enabled: false };
 }
 
-let browserControlReady: Promise<void> | null = null;
+function createBrowserControlContext(): unknown {
+  return {};
+}
+
+function createBrowserRouteDispatcher(_ctx: unknown): {
+  dispatch: (opts: unknown) => Promise<{ status: number; body: unknown }>;
+} {
+  return {
+    dispatch: async () => ({ status: 503, body: { error: "browser module removed" } }),
+  };
+}
+
+function resolveBrowserProxyConfig() {
+  return { enabled: false, allowProfiles: [] as string[] };
+}
 
 async function ensureBrowserControlService(): Promise<void> {
-  if (browserControlReady) {
-    return browserControlReady;
-  }
-  browserControlReady = (async () => {
-    const cfg = loadConfig();
-    const resolved = resolveBrowserConfig(cfg.browser, cfg);
-    if (!resolved.enabled) {
-      throw new Error("browser control disabled");
-    }
-    const started = await startBrowserControlServiceFromConfig();
-    if (!started) {
-      throw new Error("browser control disabled");
-    }
-  })();
-  return browserControlReady;
+  throw new Error("browser control disabled (browser module removed)");
 }
 
 function isProfileAllowed(params: { allowProfiles: string[]; profile?: string | null }) {
@@ -469,7 +466,7 @@ function resolveEnvPath(env?: Record<string, string>): string[] {
 }
 
 function ensureNodePathEnv(): string {
-  ensureOpenClawCliOnPath({ pathEnv: process.env.PATH ?? "" });
+  ensureFirstClawCliOnPath({ pathEnv: process.env.PATH ?? "" });
   const current = process.env.PATH ?? "";
   if (current.trim()) {
     return current;
@@ -559,10 +556,10 @@ export async function runNodeHost(opts: NodeHostRunOptions): Promise<void> {
   const browserProxyEnabled = browserProxy.enabled && resolvedBrowser.enabled;
   const isRemoteMode = cfg.gateway?.mode === "remote";
   const token =
-    process.env.OPENCLAW_GATEWAY_TOKEN?.trim() ||
+    process.env.FIRSTCLAW_GATEWAY_TOKEN?.trim() ||
     (isRemoteMode ? cfg.gateway?.remote?.token : cfg.gateway?.auth?.token);
   const password =
-    process.env.OPENCLAW_GATEWAY_PASSWORD?.trim() ||
+    process.env.FIRSTCLAW_GATEWAY_PASSWORD?.trim() ||
     (isRemoteMode ? cfg.gateway?.remote?.password : cfg.gateway?.auth?.password);
 
   const host = gateway.host ?? "127.0.0.1";
@@ -725,14 +722,14 @@ async function handleInvoke(
 
   if (command === "browser.proxy") {
     try {
+      const proxyConfig = resolveBrowserProxyConfig();
+      if (!proxyConfig.enabled) {
+        throw new Error("UNAVAILABLE: node browser proxy disabled");
+      }
       const params = decodeParams<BrowserProxyParams>(frame.paramsJSON);
       const pathValue = typeof params.path === "string" ? params.path.trim() : "";
       if (!pathValue) {
         throw new Error("INVALID_REQUEST: path required");
-      }
-      const proxyConfig = resolveBrowserProxyConfig();
-      if (!proxyConfig.enabled) {
-        throw new Error("UNAVAILABLE: node browser proxy disabled");
       }
       await ensureBrowserControlService();
       const cfg = loadConfig();

@@ -22,11 +22,6 @@ const hoisted = vi.hoisted(() => {
     }
   }
 
-  const browserStop = vi.fn(async () => {});
-  const startBrowserControlServerIfEnabled = vi.fn(async () => ({
-    stop: browserStop,
-  }));
-
   const heartbeatStop = vi.fn();
   const heartbeatUpdateConfig = vi.fn();
   const startHeartbeatRunner = vi.fn(() => ({
@@ -124,8 +119,6 @@ const hoisted = vi.hoisted(() => {
   return {
     CronService: CronServiceMock,
     cronInstances,
-    browserStop,
-    startBrowserControlServerIfEnabled,
     heartbeatStop,
     heartbeatUpdateConfig,
     startHeartbeatRunner,
@@ -142,10 +135,6 @@ const hoisted = vi.hoisted(() => {
 
 vi.mock("../cron/service.js", () => ({
   CronService: hoisted.CronService,
-}));
-
-vi.mock("./server-browser.js", () => ({
-  startBrowserControlServerIfEnabled: hoisted.startBrowserControlServerIfEnabled,
 }));
 
 vi.mock("../infra/heartbeat-runner.js", () => ({
@@ -172,22 +161,22 @@ describe("gateway hot reload", () => {
   let prevSkipGmail: string | undefined;
 
   beforeEach(() => {
-    prevSkipChannels = process.env.OPENCLAW_SKIP_CHANNELS;
-    prevSkipGmail = process.env.OPENCLAW_SKIP_GMAIL_WATCHER;
-    process.env.OPENCLAW_SKIP_CHANNELS = "0";
-    delete process.env.OPENCLAW_SKIP_GMAIL_WATCHER;
+    prevSkipChannels = process.env.FIRSTCLAW_SKIP_CHANNELS;
+    prevSkipGmail = process.env.FIRSTCLAW_SKIP_GMAIL_WATCHER;
+    process.env.FIRSTCLAW_SKIP_CHANNELS = "0";
+    delete process.env.FIRSTCLAW_SKIP_GMAIL_WATCHER;
   });
 
   afterEach(() => {
     if (prevSkipChannels === undefined) {
-      delete process.env.OPENCLAW_SKIP_CHANNELS;
+      delete process.env.FIRSTCLAW_SKIP_CHANNELS;
     } else {
-      process.env.OPENCLAW_SKIP_CHANNELS = prevSkipChannels;
+      process.env.FIRSTCLAW_SKIP_CHANNELS = prevSkipChannels;
     }
     if (prevSkipGmail === undefined) {
-      delete process.env.OPENCLAW_SKIP_GMAIL_WATCHER;
+      delete process.env.FIRSTCLAW_SKIP_GMAIL_WATCHER;
     } else {
-      process.env.OPENCLAW_SKIP_GMAIL_WATCHER = prevSkipGmail;
+      process.env.FIRSTCLAW_SKIP_GMAIL_WATCHER = prevSkipGmail;
     }
   });
 
@@ -206,7 +195,6 @@ describe("gateway hot reload", () => {
       },
       cron: { enabled: true, store: "/tmp/cron.json" },
       agents: { defaults: { heartbeat: { every: "1m" }, maxConcurrent: 2 } },
-      browser: { enabled: true },
       web: { enabled: true },
       channels: {
         telegram: { botToken: "token" },
@@ -222,7 +210,6 @@ describe("gateway hot reload", () => {
           "hooks.gmail.account",
           "cron.enabled",
           "agents.defaults.heartbeat.every",
-          "browser.enabled",
           "web.enabled",
           "channels.telegram.botToken",
           "channels.discord.token",
@@ -234,7 +221,6 @@ describe("gateway hot reload", () => {
         hotReasons: ["web.enabled"],
         reloadHooks: true,
         restartGmailWatcher: true,
-        restartBrowserControl: true,
         restartCron: true,
         restartHeartbeat: true,
         restartChannels: new Set(["whatsapp", "telegram", "discord", "signal", "imessage"]),
@@ -245,9 +231,6 @@ describe("gateway hot reload", () => {
 
     expect(hoisted.stopGmailWatcher).toHaveBeenCalled();
     expect(hoisted.startGmailWatcher).toHaveBeenCalledWith(nextConfig);
-
-    expect(hoisted.browserStop).toHaveBeenCalledTimes(1);
-    expect(hoisted.startBrowserControlServerIfEnabled).toHaveBeenCalledTimes(2);
 
     expect(hoisted.startHeartbeatRunner).toHaveBeenCalledTimes(1);
     expect(hoisted.heartbeatUpdateConfig).toHaveBeenCalledTimes(1);

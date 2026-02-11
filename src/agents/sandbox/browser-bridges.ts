@@ -1,3 +1,6 @@
-import type { BrowserBridge } from "../../browser/bridge-server.js";
+/* Browser module removed - empty stub for sandbox prune/manage compatibility */
 
-export const BROWSER_BRIDGES = new Map<string, { bridge: BrowserBridge; containerName: string }>();
+export const BROWSER_BRIDGES = new Map<
+  string,
+  { bridge: { server: unknown }; containerName: string }
+>();

@@ -22,17 +22,26 @@ export function buildInboundMediaNote(ctx: MsgContext): string | undefined {
   const suppressed = new Set<number>();
   if (Array.isArray(ctx.MediaUnderstanding)) {
     for (const output of ctx.MediaUnderstanding) {
-      suppressed.add(output.attachmentIndex);
+      const index = (output as Record<string, unknown>).attachmentIndex;
+      if (typeof index === "number") {
+        suppressed.add(index);
+      }
     }
   }
   if (Array.isArray(ctx.MediaUnderstandingDecisions)) {
     for (const decision of ctx.MediaUnderstandingDecisions) {
-      if (decision.outcome !== "success") {
+      if ((decision as Record<string, unknown>).outcome !== "success") {
         continue;
       }
-      for (const attachment of decision.attachments) {
-        if (attachment.chosen?.outcome === "success") {
-          suppressed.add(attachment.attachmentIndex);
+      const attachments = (decision as Record<string, unknown>).attachments;
+      if (Array.isArray(attachments)) {
+        for (const attachment of attachments as Array<Record<string, unknown>>) {
+          if ((attachment.chosen as Record<string, unknown> | undefined)?.outcome === "success") {
+            const idx = attachment.attachmentIndex;
+            if (typeof idx === "number") {
+              suppressed.add(idx);
+            }
+          }
         }
       }
     }

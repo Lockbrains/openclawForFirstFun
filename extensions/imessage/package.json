@@ -1,13 +1,13 @@
 {
-  "name": "@openclaw/imessage",
+  "name": "@firstclaw/imessage",
   "version": "2026.2.10",
   "private": true,
-  "description": "OpenClaw iMessage channel plugin",
+  "description": "FirstClaw iMessage channel plugin",
   "type": "module",
   "devDependencies": {
-    "openclaw": "workspace:*"
+    "firstclaw": "workspace:*"
   },
-  "openclaw": {
+  "firstclaw": {
     "extensions": [
       "./index.ts"
     ]

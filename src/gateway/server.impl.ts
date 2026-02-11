@@ -1,9 +1,7 @@
 import path from "node:path";
-import type { CanvasHostServer } from "../canvas-host/server.js";
 import type { PluginServicesHandle } from "../plugins/services.js";
 import type { RuntimeEnv } from "../runtime.js";
 import type { ControlUiRootState } from "./control-ui.js";
-import type { startBrowserControlServerIfEnabled } from "./server-browser.js";
 import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "../agents/agent-scope.js";
 import { registerSkillsChangeListener } from "../agents/skills/refresh.js";
 import { initSubagentRegistry } from "../agents/subagent-registry.js";
@@ -31,7 +29,7 @@ import { createExecApprovalForwarder } from "../infra/exec-approval-forwarder.js
 import { onHeartbeatEvent } from "../infra/heartbeat-events.js";
 import { startHeartbeatRunner } from "../infra/heartbeat-runner.js";
 import { getMachineDisplayName } from "../infra/machine-name.js";
-import { ensureOpenClawCliOnPath } from "../infra/path-env.js";
+import { ensureFirstClawCliOnPath } from "../infra/path-env.js";
 import { setGatewaySigusr1RestartPolicy } from "../infra/restart.js";
 import {
   primeRemoteSkillsCache,
@@ -80,14 +78,13 @@ import { loadGatewayTlsRuntime } from "./server/tls.js";
 
 export { __resetModelCatalogCacheForTest } from "./server-model-catalog.js";
 
-ensureOpenClawCliOnPath();
+ensureFirstClawCliOnPath();
 
 const log = createSubsystemLogger("gateway");
 const logCanvas = log.child("canvas");
 const logDiscovery = log.child("discovery");
 const logTailscale = log.child("tailscale");
 const logChannels = log.child("channels");
-const logBrowser = log.child("browser");
 const logHealth = log.child("health");
 const logCron = log.child("cron");
 const logReload = log.child("reload");
@@ -157,13 +154,13 @@ export async function startGatewayServer(
   opts: GatewayServerOptions = {},
 ): Promise<GatewayServer> {
   // Ensure all default port derivations (browser/canvas) see the actual runtime port.
-  process.env.OPENCLAW_GATEWAY_PORT = String(port);
+  process.env.FIRSTCLAW_GATEWAY_PORT = String(port);
   logAcceptedEnvOption({
-    key: "OPENCLAW_RAW_STREAM",
+    key: "FIRSTCLAW_RAW_STREAM",
     description: "raw stream logging enabled",
   });
   logAcceptedEnvOption({
-    key: "OPENCLAW_RAW_STREAM_PATH",
+    key: "FIRSTCLAW_RAW_STREAM_PATH",
     description: "raw stream log path override",
   });
 
@@ -177,7 +174,7 @@ export async function startGatewayServer(
     const { config: migrated, changes } = migrateLegacyConfig(configSnapshot.parsed);
     if (!migrated) {
       throw new Error(
-        `Legacy config entries detected but auto-migration failed. Run "${formatCliCommand("openclaw doctor")}" to migrate.`,
+        `Legacy config entries detected but auto-migration failed. Run "${formatCliCommand("firstclaw doctor")}" to migrate.`,
       );
     }
     await writeConfigFile(migrated);
@@ -199,7 +196,7 @@ export async function startGatewayServer(
             .join("\n")
         : "Unknown validation issue.";
     throw new Error(
-      `Invalid config at ${configSnapshot.path}.\n${issues}\nRun "${formatCliCommand("openclaw doctor")}" to repair, then retry.`,
+      `Invalid config at ${configSnapshot.path}.\n${issues}\nRun "${formatCliCommand("firstclaw doctor")}" to repair, then retry.`,
     );
   }
 
@@ -305,7 +302,7 @@ export async function startGatewayServer(
   const { wizardSessions, findRunningWizard, purgeWizardSession } = createWizardSessionTracker();
 
   const deps = createDefaultDeps();
-  let canvasHostServer: CanvasHostServer | null = null;
+  const canvasHostServer: { port?: number; close: () => Promise<void> } | null = null;
   const gatewayTls = await loadGatewayTlsRuntime(cfgAtStart.gateway?.tls, log.child("tls"));
   if (cfgAtStart.gateway?.tls?.enabled && !gatewayTls.enabled) {
     throw new Error(gatewayTls.error ?? "gateway tls: failed to enable");
@@ -467,7 +464,7 @@ export async function startGatewayServer(
     forwarder: execApprovalForwarder,
   });
 
-  const canvasHostServerPort = (canvasHostServer as CanvasHostServer | null)?.port;
+  const canvasHostServerPort: number | undefined = undefined;
 
   attachGatewayWsHandlers({
     wss,
@@ -545,8 +542,7 @@ export async function startGatewayServer(
     logTailscale,
   });
 
-  let browserControl: Awaited<ReturnType<typeof startBrowserControlServerIfEnabled>> = null;
-  ({ browserControl, pluginServices } = await startGatewaySidecars({
+  ({ pluginServices } = await startGatewaySidecars({
     cfg: cfgAtStart,
     pluginRegistry,
     defaultWorkspaceDir,
@@ -555,7 +551,6 @@ export async function startGatewayServer(
     log,
     logHooks,
     logChannels,
-    logBrowser,
   }));
 
   const { applyHotReload, requestGatewayRestart } = createGatewayReloadHandlers({
@@ -565,7 +560,6 @@ export async function startGatewayServer(
       hooksConfig,
       heartbeatRunner,
       cronState,
-      browserControl,
     }),
     setState: (nextState) => {
       hooksConfig = nextState.hooksConfig;
@@ -573,12 +567,10 @@ export async function startGatewayServer(
       cronState = nextState.cronState;
       cron = cronState.cron;
       cronStorePath = cronState.storePath;
-      browserControl = nextState.browserControl;
     },
     startChannel,
     stopChannel,
     logHooks,
-    logBrowser,
     logChannels,
     logCron,
     logReload,
@@ -616,7 +608,6 @@ export async function startGatewayServer(
     chatRunState,
     clients,
     configReloader,
-    browserControl,
     wss,
     httpServer,
     httpServers,

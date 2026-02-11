@@ -1,0 +1,72 @@
+---
+description: FirstClaw (FirstClaw Custom) Development Rules
+globs: ["src/**/*.ts", "extensions/**/*.ts"]
+---
+
+# FirstClaw Development Rules
+
+You are working on **FirstClaw**, a customized, secured, and simplified version of FirstClaw for internal office use (~15 engineers).
+
+## 1. Core Philosophy
+- **No Localization**: Output remains in **English**. Do not add i18n or Chinese strings.
+- **Stability First**: The service must remain online and stable. Prefer robust error handling over experimental features.
+- **Security First**: Prevent API key leakage at the program level.
+
+## 2. Channel Restrictions
+- **Allowed Channels**: 
+  - **Lark (Feishu)**: Primary interface for Project Management & HR (`extensions/feishu`).
+  - **iMessage**: Secondary interface (`src/imessage`, `extensions/imessage`).
+- **Forbidden Channels**: All others (Discord, Telegram, Slack, Signal, WhatsApp, Matrix, MS Teams, etc.) have been **removed**.
+- **Plugin Allowlist**: `src/plugins/discovery.ts` has a hardcoded `ALLOWED_EXTENSIONS` set. Only listed extensions are loaded. To add a new extension, add its folder name to this set.
+
+## 3. Agent Capabilities & Orchestration
+- **Primary Role**: Project Management (PM) & HR on Lark.
+- **Allowed Capabilities**: Standard LLM features (QA, Code, Image Gen) + orchestration of internal engineering agents.
+- **Removed Components**: Browser automation (`src/browser`), media understanding (`src/media-understanding`), TTS (`src/tts`), Canvas (`src/canvas-host`) have all been deleted.
+
+## 4. Security Mechanisms (Implemented)
+
+### 4.1 Output Guard (API Key Leak Prevention)
+- **Location**: `src/security/output-guard.ts`
+- **Tests**: `src/security/output-guard.test.ts`
+- **Integration**: Hooked into `src/infra/outbound/deliver.ts` at `deliverOutboundPayloads()`.
+- **How it works**: Every outbound message passes through `guardOutput()` which scans for 20+ sensitive patterns (OpenAI keys, GitHub tokens, AWS keys, JWTs, SSH keys, Bearer tokens, generic secret assignments, etc.) and redacts them with `[REDACTED]` before delivery.
+- **Logging**: Redaction events are logged via `deliverLog.warn("Output guard redacted sensitive content", ...)`.
+- **When modifying outbound code**: Always ensure `guardOutput()` runs before any `sendText`/`sendMedia` call. Never bypass it.
+
+### 4.2 Subagent Iteration Limits
+- **Location**: `src/agents/tools/sessions-send-helpers.ts`
+- **Defaults changed**:
+  - `DEFAULT_PING_PONG_TURNS`: 5 → **2**
+  - `MAX_PING_PONG_TURNS`: 5 → **3** (hard ceiling)
+- **Schema enforcement**: `src/config/zod-schema.session.ts` limits `maxPingPongTurns` to `max(3)`.
+- **Agent timeout**: `src/agents/timeout.ts` enforces:
+  - `DEFAULT_AGENT_TIMEOUT_SECONDS`: 600 → **120** (2 minutes)
+  - `MAX_AGENT_TIMEOUT_SECONDS`: **300** (5 minutes hard ceiling)
+- **When adding new agent loops**: Always check for iteration bounds. Never create unbounded loops.
+
+### 4.3 Multi-User Context Isolation
+- **Default changed**: `dmScope` defaults to `"per-channel-peer"` (was `"main"`).
+- **Files changed**: `src/routing/session-key.ts`, `src/routing/resolve-route.ts`, `src/infra/outbound/outbound-session.ts`.
+- **How it works**: Each user (identified by their Lark User ID or iMessage handle) gets a completely isolated session key: `agent:<agentId>:<channel>:direct:<userId>`. This means:
+  - User A's conversation history is never visible to User B.
+  - Each user has independent context, memory, and state.
+  - Group chats use `agent:<agentId>:<channel>:group:<groupId>` (shared by design).
+
+## 5. Codebase Maintenance
+- **Extensions kept**: `feishu`, `imessage`, `bluebubbles`, `device-pair`, `memory-core`, `memory-lancedb`, `diagnostics-otel`, `llm-task`, `lobster`, and auth plugins.
+- **Dependencies cleaned**: Removed `playwright-core`, `@whiskeysockets/baileys`, `grammy`, `@slack/bolt`, `discord-api-types`, `node-edge-tts`, etc.
+- **Type safety**: Keep TypeScript strict. Avoid `any`.
+- **Testing**: Run `pnpm test` before pushing changes to security-critical code.
+
+## 6. Quick Reference Paths
+| Purpose | Path |
+|---------|------|
+| Output Guard | `src/security/output-guard.ts` |
+| Outbound Delivery | `src/infra/outbound/deliver.ts` |
+| Subagent Limits | `src/agents/tools/sessions-send-helpers.ts` |
+| Agent Timeout | `src/agents/timeout.ts` |
+| Session Key (dmScope) | `src/routing/session-key.ts` |
+| Plugin Allowlist | `src/plugins/discovery.ts` |
+| Lark Extension | `extensions/feishu/` |
+| iMessage Extension | `extensions/imessage/` |

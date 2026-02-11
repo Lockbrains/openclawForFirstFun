@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, afterEach } from "vitest";
 import { resetGlobalHookRunner } from "../plugins/hook-runner-global.js";
-import { loadOpenClawPlugins } from "../plugins/loader.js";
+import { loadFirstClawPlugins } from "../plugins/loader.js";
 import { guardSessionManager } from "./session-tool-result-guard-wrapper.js";
 
 const EMPTY_PLUGIN_SCHEMA = { type: "object", additionalProperties: false, properties: {} };
@@ -16,7 +16,7 @@ function writeTempPlugin(params: { dir: string; id: string; body: string }): str
   const file = path.join(pluginDir, `${params.id}.mjs`);
   fs.writeFileSync(file, params.body, "utf-8");
   fs.writeFileSync(
-    path.join(pluginDir, "openclaw.plugin.json"),
+    path.join(pluginDir, "firstclaw.plugin.json"),
     JSON.stringify(
       {
         id: params.id,
@@ -67,13 +67,13 @@ describe("tool_result_persist hook", () => {
   });
 
   it("composes transforms in priority order and allows stripping toolResult.details", () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-toolpersist-"));
-    process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = "/nonexistent/bundled/plugins";
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "firstclaw-toolpersist-"));
+    process.env.FIRSTCLAW_BUNDLED_PLUGINS_DIR = "/nonexistent/bundled/plugins";
 
     const pluginA = writeTempPlugin({
       dir: tmp,
-      id: "persist-a",
-      body: `export default { id: "persist-a", register(api) {
+      id: "feishu",
+      body: `export default { id: "feishu", register(api) {
   api.on("tool_result_persist", (event, ctx) => {
     const msg = event.message;
     // Example: remove large diagnostic payloads before persistence.
@@ -85,8 +85,8 @@ describe("tool_result_persist hook", () => {
 
     const pluginB = writeTempPlugin({
       dir: tmp,
-      id: "persist-b",
-      body: `export default { id: "persist-b", register(api) {
+      id: "imessage",
+      body: `export default { id: "imessage", register(api) {
   api.on("tool_result_persist", (event) => {
     const prior = (event.message && event.message.persistOrder) ? event.message.persistOrder : [];
     return { message: { ...event.message, persistOrder: [...prior, "b"] } };
@@ -94,13 +94,13 @@ describe("tool_result_persist hook", () => {
 } };`,
     });
 
-    loadOpenClawPlugins({
+    loadFirstClawPlugins({
       cache: false,
       workspaceDir: tmp,
       config: {
         plugins: {
           load: { paths: [pluginA, pluginB] },
-          allow: ["persist-a", "persist-b"],
+          allow: ["feishu", "imessage"],
         },
       },
     });

@@ -7,30 +7,30 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 const tempDirs: string[] = [];
 
 function makeTempDir() {
-  const dir = path.join(os.tmpdir(), `openclaw-plugins-${randomUUID()}`);
+  const dir = path.join(os.tmpdir(), `firstclaw-plugins-${randomUUID()}`);
   fs.mkdirSync(dir, { recursive: true });
   tempDirs.push(dir);
   return dir;
 }
 
 async function withStateDir<T>(stateDir: string, fn: () => Promise<T>) {
-  const prev = process.env.OPENCLAW_STATE_DIR;
-  const prevBundled = process.env.OPENCLAW_BUNDLED_PLUGINS_DIR;
-  process.env.OPENCLAW_STATE_DIR = stateDir;
-  process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = "/nonexistent/bundled/plugins";
+  const prev = process.env.FIRSTCLAW_STATE_DIR;
+  const prevBundled = process.env.FIRSTCLAW_BUNDLED_PLUGINS_DIR;
+  process.env.FIRSTCLAW_STATE_DIR = stateDir;
+  process.env.FIRSTCLAW_BUNDLED_PLUGINS_DIR = "/nonexistent/bundled/plugins";
   vi.resetModules();
   try {
     return await fn();
   } finally {
     if (prev === undefined) {
-      delete process.env.OPENCLAW_STATE_DIR;
+      delete process.env.FIRSTCLAW_STATE_DIR;
     } else {
-      process.env.OPENCLAW_STATE_DIR = prev;
+      process.env.FIRSTCLAW_STATE_DIR = prev;
     }
     if (prevBundled === undefined) {
-      delete process.env.OPENCLAW_BUNDLED_PLUGINS_DIR;
+      delete process.env.FIRSTCLAW_BUNDLED_PLUGINS_DIR;
     } else {
-      process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = prevBundled;
+      process.env.FIRSTCLAW_BUNDLED_PLUGINS_DIR = prevBundled;
     }
     vi.resetModules();
   }
@@ -46,73 +46,43 @@ afterEach(() => {
   }
 });
 
-describe("discoverOpenClawPlugins", () => {
+describe("discoverFirstClawPlugins", () => {
   it("discovers global and workspace extensions", async () => {
     const stateDir = makeTempDir();
     const workspaceDir = path.join(stateDir, "workspace");
 
     const globalExt = path.join(stateDir, "extensions");
     fs.mkdirSync(globalExt, { recursive: true });
-    fs.writeFileSync(path.join(globalExt, "alpha.ts"), "export default function () {}", "utf-8");
+    fs.writeFileSync(path.join(globalExt, "feishu.ts"), "export default function () {}", "utf-8");
 
-    const workspaceExt = path.join(workspaceDir, ".openclaw", "extensions");
+    const workspaceExt = path.join(workspaceDir, ".firstclaw", "extensions");
     fs.mkdirSync(workspaceExt, { recursive: true });
-    fs.writeFileSync(path.join(workspaceExt, "beta.ts"), "export default function () {}", "utf-8");
+    fs.writeFileSync(
+      path.join(workspaceExt, "imessage.ts"),
+      "export default function () {}",
+      "utf-8",
+    );
 
     const { candidates } = await withStateDir(stateDir, async () => {
-      const { discoverOpenClawPlugins } = await import("./discovery.js");
-      return discoverOpenClawPlugins({ workspaceDir });
+      const { discoverFirstClawPlugins } = await import("./discovery.js");
+      return discoverFirstClawPlugins({ workspaceDir });
     });
 
     const ids = candidates.map((c) => c.idHint);
-    expect(ids).toContain("alpha");
-    expect(ids).toContain("beta");
+    expect(ids).toContain("feishu");
+    expect(ids).toContain("imessage");
   });
 
   it("loads package extension packs", async () => {
     const stateDir = makeTempDir();
-    const globalExt = path.join(stateDir, "extensions", "pack");
+    const globalExt = path.join(stateDir, "extensions", "llm-task");
     fs.mkdirSync(path.join(globalExt, "src"), { recursive: true });
 
     fs.writeFileSync(
       path.join(globalExt, "package.json"),
       JSON.stringify({
-        name: "pack",
-        openclaw: { extensions: ["./src/one.ts", "./src/two.ts"] },
-      }),
-      "utf-8",
-    );
-    fs.writeFileSync(
-      path.join(globalExt, "src", "one.ts"),
-      "export default function () {}",
-      "utf-8",
-    );
-    fs.writeFileSync(
-      path.join(globalExt, "src", "two.ts"),
-      "export default function () {}",
-      "utf-8",
-    );
-
-    const { candidates } = await withStateDir(stateDir, async () => {
-      const { discoverOpenClawPlugins } = await import("./discovery.js");
-      return discoverOpenClawPlugins({});
-    });
-
-    const ids = candidates.map((c) => c.idHint);
-    expect(ids).toContain("pack/one");
-    expect(ids).toContain("pack/two");
-  });
-
-  it("derives unscoped ids for scoped packages", async () => {
-    const stateDir = makeTempDir();
-    const globalExt = path.join(stateDir, "extensions", "voice-call-pack");
-    fs.mkdirSync(path.join(globalExt, "src"), { recursive: true });
-
-    fs.writeFileSync(
-      path.join(globalExt, "package.json"),
-      JSON.stringify({
-        name: "@openclaw/voice-call",
-        openclaw: { extensions: ["./src/index.ts"] },
+        name: "@firstclaw/llm-task",
+        firstclaw: { extensions: ["./src/index.ts"] },
       }),
       "utf-8",
     );
@@ -123,35 +93,63 @@ describe("discoverOpenClawPlugins", () => {
     );
 
     const { candidates } = await withStateDir(stateDir, async () => {
-      const { discoverOpenClawPlugins } = await import("./discovery.js");
-      return discoverOpenClawPlugins({});
+      const { discoverFirstClawPlugins } = await import("./discovery.js");
+      return discoverFirstClawPlugins({});
     });
 
     const ids = candidates.map((c) => c.idHint);
-    expect(ids).toContain("voice-call");
+    expect(ids).toContain("llm-task");
+  });
+
+  it("derives unscoped ids for scoped packages", async () => {
+    const stateDir = makeTempDir();
+    const globalExt = path.join(stateDir, "extensions", "device-pair-pack");
+    fs.mkdirSync(path.join(globalExt, "src"), { recursive: true });
+
+    fs.writeFileSync(
+      path.join(globalExt, "package.json"),
+      JSON.stringify({
+        name: "@firstclaw/device-pair",
+        firstclaw: { extensions: ["./src/index.ts"] },
+      }),
+      "utf-8",
+    );
+    fs.writeFileSync(
+      path.join(globalExt, "src", "index.ts"),
+      "export default function () {}",
+      "utf-8",
+    );
+
+    const { candidates } = await withStateDir(stateDir, async () => {
+      const { discoverFirstClawPlugins } = await import("./discovery.js");
+      return discoverFirstClawPlugins({});
+    });
+
+    const ids = candidates.map((c) => c.idHint);
+    expect(ids).toContain("device-pair");
   });
 
   it("treats configured directory paths as plugin packages", async () => {
     const stateDir = makeTempDir();
-    const packDir = path.join(stateDir, "packs", "demo-plugin-dir");
+    const packDir = path.join(stateDir, "packs", "lobster");
     fs.mkdirSync(packDir, { recursive: true });
 
     fs.writeFileSync(
       path.join(packDir, "package.json"),
       JSON.stringify({
-        name: "@openclaw/demo-plugin-dir",
-        openclaw: { extensions: ["./index.js"] },
+        name: "@firstclaw/lobster",
+        firstclaw: { extensions: ["./index.js"] },
       }),
       "utf-8",
     );
     fs.writeFileSync(path.join(packDir, "index.js"), "module.exports = {}", "utf-8");
 
     const { candidates } = await withStateDir(stateDir, async () => {
-      const { discoverOpenClawPlugins } = await import("./discovery.js");
-      return discoverOpenClawPlugins({ extraPaths: [packDir] });
+      const { discoverFirstClawPlugins } = await import("./discovery.js");
+      return discoverFirstClawPlugins({ extraPaths: [packDir] });
     });
 
     const ids = candidates.map((c) => c.idHint);
-    expect(ids).toContain("demo-plugin-dir");
+    expect(ids).toContain("lobster");
   });
 });

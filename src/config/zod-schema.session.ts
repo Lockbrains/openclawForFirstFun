@@ -89,7 +89,8 @@ export const SessionSchema = z
     sendPolicy: SessionSendPolicySchema.optional(),
     agentToAgent: z
       .object({
-        maxPingPongTurns: z.number().int().min(0).max(5).optional(),
+        // FirstClaw: Hard ceiling at 3 to prevent token explosion
+        maxPingPongTurns: z.number().int().min(0).max(3).optional(),
       })
       .strict()
       .optional(),

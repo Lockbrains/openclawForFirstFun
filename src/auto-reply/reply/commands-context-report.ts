@@ -5,7 +5,7 @@ import { resolveSessionAgentIds } from "../../agents/agent-scope.js";
 import { resolveBootstrapContextForRun } from "../../agents/bootstrap-files.js";
 import { resolveDefaultModelForAgent } from "../../agents/model-selection.js";
 import { resolveBootstrapMaxChars } from "../../agents/pi-embedded-helpers.js";
-import { createOpenClawCodingTools } from "../../agents/pi-tools.js";
+import { createFirstClawCodingTools } from "../../agents/pi-tools.js";
 import { resolveSandboxRuntimeStatus } from "../../agents/sandbox.js";
 import { buildWorkspaceSkillSnapshot } from "../../agents/skills.js";
 import { getSkillsSnapshotVersion } from "../../agents/skills/refresh.js";
@@ -14,8 +14,6 @@ import { buildSystemPromptReport } from "../../agents/system-prompt-report.js";
 import { buildAgentSystemPrompt } from "../../agents/system-prompt.js";
 import { buildToolSummaryMap } from "../../agents/tool-summaries.js";
 import { getRemoteSkillEligibility } from "../../infra/skills-remote.js";
-import { buildTtsSystemPromptHint } from "../../tts/tts.js";
-
 function estimateTokensFromChars(chars: number): number {
   return Math.ceil(Math.max(0, chars) / 4);
 }
@@ -83,7 +81,7 @@ async function resolveContextReport(
   });
   const tools = (() => {
     try {
-      return createOpenClawCodingTools({
+      return createFirstClawCodingTools({
         config: params.cfg,
         workspaceDir,
         sessionKey: params.sessionKey,
@@ -136,7 +134,6 @@ async function resolveContextReport(
         },
       }
     : { enabled: false };
-  const ttsHint = params.cfg ? buildTtsSystemPromptHint(params.cfg) : undefined;
 
   const systemPrompt = buildAgentSystemPrompt({
     workspaceDir,
@@ -154,7 +151,7 @@ async function resolveContextReport(
     contextFiles: injectedFiles,
     skillsPrompt,
     heartbeatPrompt: undefined,
-    ttsHint,
+    ttsHint: undefined,
     runtimeInfo,
     sandboxInfo,
     memoryCitationsMode: params.cfg?.memory?.citations,

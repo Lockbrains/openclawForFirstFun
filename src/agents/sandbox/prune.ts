@@ -1,5 +1,8 @@
 import type { SandboxConfig } from "./types.js";
-import { stopBrowserBridgeServer } from "../../browser/bridge-server.js";
+
+async function stopBrowserBridgeServer(_server: unknown): Promise<void> {
+  // Stub: browser module removed
+}
 import { defaultRuntime } from "../../runtime.js";
 import { BROWSER_BRIDGES } from "./browser-bridges.js";
 import { dockerContainerState, execDocker } from "./docker.js";

@@ -5,11 +5,27 @@ import { resolveConfigDir, resolveUserPath } from "../utils.js";
 import { resolveBundledPluginsDir } from "./bundled-dir.js";
 import {
   getPackageManifestMetadata,
-  type OpenClawPackageManifest,
+  type FirstClawPackageManifest,
   type PackageManifest,
 } from "./manifest.js";
 
 const EXTENSION_EXTS = new Set([".ts", ".js", ".mts", ".cts", ".mjs", ".cjs"]);
+
+const ALLOWED_EXTENSIONS = new Set([
+  "feishu",
+  "imessage",
+  "bluebubbles",
+  "device-pair",
+  "memory-core",
+  "memory-lancedb",
+  "google-antigravity-auth",
+  "google-gemini-cli-auth",
+  "minimax-portal-auth",
+  "qwen-portal-auth",
+  "diagnostics-otel",
+  "llm-task",
+  "lobster",
+]);
 
 export type PluginCandidate = {
   idHint: string;
@@ -21,7 +37,7 @@ export type PluginCandidate = {
   packageVersion?: string;
   packageDescription?: string;
   packageDir?: string;
-  packageManifest?: OpenClawPackageManifest;
+  packageManifest?: FirstClawPackageManifest;
 };
 
 export type PluginDiscoveryResult = {
@@ -70,7 +86,7 @@ function deriveIdHint(params: {
   }
 
   // Prefer the unscoped name so config keys stay stable even when the npm
-  // package is scoped (example: @openclaw/voice-call -> voice-call).
+  // package is scoped (example: @firstclaw/voice-call -> voice-call).
   const unscoped = rawPackageName.includes("/")
     ? (rawPackageName.split("/").pop() ?? rawPackageName)
     : rawPackageName;
@@ -93,6 +109,9 @@ function addCandidate(params: {
   packageDir?: string;
 }) {
   const resolved = path.resolve(params.source);
+  if (!ALLOWED_EXTENSIONS.has(params.idHint)) {
+    return;
+  }
   if (params.seen.has(resolved)) {
     return;
   }
@@ -298,7 +317,7 @@ function discoverFromPath(params: {
   }
 }
 
-export function discoverOpenClawPlugins(params: {
+export function discoverFirstClawPlugins(params: {
   workspaceDir?: string;
   extraPaths?: string[];
 }): PluginDiscoveryResult {
@@ -327,7 +346,7 @@ export function discoverOpenClawPlugins(params: {
   }
   if (workspaceDir) {
     const workspaceRoot = resolveUserPath(workspaceDir);
-    const workspaceExtDirs = [path.join(workspaceRoot, ".openclaw", "extensions")];
+    const workspaceExtDirs = [path.join(workspaceRoot, ".firstclaw", "extensions")];
     for (const dir of workspaceExtDirs) {
       discoverInDirectory({
         dir,

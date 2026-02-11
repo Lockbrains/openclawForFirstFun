@@ -1,5 +1,5 @@
 import chokidar from "chokidar";
-import type { OpenClawConfig, ConfigFileSnapshot, GatewayReloadMode } from "../config/config.js";
+import type { FirstClawConfig, ConfigFileSnapshot, GatewayReloadMode } from "../config/config.js";
 import { type ChannelId, listChannelPlugins } from "../channels/plugins/index.js";
 import { getActivePluginRegistry } from "../plugins/runtime.js";
 import { isPlainObject } from "../utils.js";
@@ -18,7 +18,6 @@ export type GatewayReloadPlan = {
   hotReasons: string[];
   reloadHooks: boolean;
   restartGmailWatcher: boolean;
-  restartBrowserControl: boolean;
   restartCron: boolean;
   restartHeartbeat: boolean;
   restartChannels: Set<ChannelKind>;
@@ -34,7 +33,6 @@ type ReloadRule = {
 type ReloadAction =
   | "reload-hooks"
   | "restart-gmail-watcher"
-  | "restart-browser-control"
   | "restart-cron"
   | "restart-heartbeat"
   | `restart-channel:${ChannelId}`;
@@ -56,11 +54,6 @@ const BASE_RELOAD_RULES: ReloadRule[] = [
   },
   { prefix: "agent.heartbeat", kind: "hot", actions: ["restart-heartbeat"] },
   { prefix: "cron", kind: "hot", actions: ["restart-cron"] },
-  {
-    prefix: "browser",
-    kind: "hot",
-    actions: ["restart-browser-control"],
-  },
 ];
 
 const BASE_RELOAD_RULES_TAIL: ReloadRule[] = [
@@ -156,7 +149,7 @@ export function diffConfigPaths(prev: unknown, next: unknown, prefix = ""): stri
   return [prefix || "<root>"];
 }
 
-export function resolveGatewayReloadSettings(cfg: OpenClawConfig): GatewayReloadSettings {
+export function resolveGatewayReloadSettings(cfg: FirstClawConfig): GatewayReloadSettings {
   const rawMode = cfg.gateway?.reload?.mode;
   const mode =
     rawMode === "off" || rawMode === "restart" || rawMode === "hot" || rawMode === "hybrid"
@@ -178,7 +171,6 @@ export function buildGatewayReloadPlan(changedPaths: string[]): GatewayReloadPla
     hotReasons: [],
     reloadHooks: false,
     restartGmailWatcher: false,
-    restartBrowserControl: false,
     restartCron: false,
     restartHeartbeat: false,
     restartChannels: new Set(),
@@ -197,9 +189,6 @@ export function buildGatewayReloadPlan(changedPaths: string[]): GatewayReloadPla
         break;
       case "restart-gmail-watcher":
         plan.restartGmailWatcher = true;
-        break;
-      case "restart-browser-control":
-        plan.restartBrowserControl = true;
         break;
       case "restart-cron":
         plan.restartCron = true;
@@ -246,10 +235,10 @@ export type GatewayConfigReloader = {
 };
 
 export function startGatewayConfigReloader(opts: {
-  initialConfig: OpenClawConfig;
+  initialConfig: FirstClawConfig;
   readSnapshot: () => Promise<ConfigFileSnapshot>;
-  onHotReload: (plan: GatewayReloadPlan, nextConfig: OpenClawConfig) => Promise<void>;
-  onRestart: (plan: GatewayReloadPlan, nextConfig: OpenClawConfig) => void;
+  onHotReload: (plan: GatewayReloadPlan, nextConfig: FirstClawConfig) => Promise<void>;
+  onRestart: (plan: GatewayReloadPlan, nextConfig: FirstClawConfig) => void;
   log: {
     info: (msg: string) => void;
     warn: (msg: string) => void;

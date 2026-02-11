@@ -149,7 +149,8 @@ export function buildAgentPeerSessionKey(params: {
 }): string {
   const peerKind = params.peerKind ?? "direct";
   if (peerKind === "direct") {
-    const dmScope = params.dmScope ?? "main";
+    // FirstClaw: Default to per-channel-peer to isolate multi-user DM sessions
+    const dmScope = params.dmScope ?? "per-channel-peer";
     let peerId = (params.peerId ?? "").trim();
     const linkedPeerId =
       dmScope === "main"

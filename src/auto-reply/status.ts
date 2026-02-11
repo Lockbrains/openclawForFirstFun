@@ -1,7 +1,6 @@
 import fs from "node:fs";
 import type { SkillCommandSpec } from "../agents/skills.js";
-import type { OpenClawConfig } from "../config/config.js";
-import type { MediaUnderstandingDecision } from "../media-understanding/types.js";
+import type { FirstClawConfig } from "../config/config.js";
 import type { CommandCategory } from "./commands-registry.types.js";
 import type { ElevatedLevel, ReasoningLevel, ThinkLevel, VerboseLevel } from "./thinking.js";
 import { lookupContextTokens } from "../agents/context.js";
@@ -20,14 +19,6 @@ import { formatTimeAgo } from "../infra/format-time/format-relative.ts";
 import { resolveCommitHash } from "../infra/git-commit.js";
 import { listPluginCommands } from "../plugins/commands.js";
 import {
-  getTtsMaxLength,
-  getTtsProvider,
-  isSummarizationEnabled,
-  resolveTtsAutoMode,
-  resolveTtsConfig,
-  resolveTtsPrefsPath,
-} from "../tts/tts.js";
-import {
   estimateUsageCost,
   formatTokenCount as formatTokenCountShared,
   formatUsd,
@@ -40,7 +31,7 @@ import {
   type ChatCommandDefinition,
 } from "./commands-registry.js";
 
-type AgentConfig = Partial<NonNullable<NonNullable<OpenClawConfig["agents"]>["defaults"]>>;
+type AgentConfig = Partial<NonNullable<NonNullable<FirstClawConfig["agents"]>["defaults"]>>;
 
 export const formatTokenCount = formatTokenCountShared;
 
@@ -54,7 +45,7 @@ type QueueStatus = {
 };
 
 type StatusArgs = {
-  config?: OpenClawConfig;
+  config?: FirstClawConfig;
   agent: AgentConfig;
   sessionEntry?: SessionEntry;
   sessionKey?: string;
@@ -68,7 +59,14 @@ type StatusArgs = {
   usageLine?: string;
   timeLine?: string;
   queue?: QueueStatus;
-  mediaDecisions?: MediaUnderstandingDecision[];
+  mediaDecisions?: Array<{
+    capability?: string;
+    outcome?: string;
+    attachments?: Array<{
+      chosen?: { provider?: string; model?: string };
+      attempts?: Array<{ reason?: string }>;
+    }>;
+  }>;
   subagentsLine?: string;
   includeTranscriptUsage?: boolean;
   now?: number;
@@ -174,7 +172,7 @@ const readUsageFromSessionLog = (
       model?: string;
     }
   | undefined => {
-  // Transcripts are stored at the session file path (fallback: ~/.openclaw/sessions/<SessionId>.jsonl)
+  // Transcripts are stored at the session file path (fallback: ~/.firstclaw/sessions/<SessionId>.jsonl)
   if (!sessionId) {
     return undefined;
   }
@@ -240,18 +238,25 @@ const formatUsagePair = (input?: number | null, output?: number | null) => {
   return `🧮 Tokens: ${inputLabel} in / ${outputLabel} out`;
 };
 
-const formatMediaUnderstandingLine = (decisions?: MediaUnderstandingDecision[]) => {
+// FirstClaw: Media understanding removed - stub to return null
+type MediaUnderstandingDecisionStub = Record<string, unknown>;
+
+const formatMediaUnderstandingLine = (decisions?: MediaUnderstandingDecisionStub[]) => {
   if (!decisions || decisions.length === 0) {
     return null;
   }
   const parts = decisions
-    .map((decision) => {
-      const count = decision.attachments.length;
+    .map((decision: Record<string, unknown>) => {
+      const attachments = (decision.attachments ?? []) as Array<Record<string, unknown>>;
+      const count = attachments.length;
       const countLabel = count > 1 ? ` x${count}` : "";
       if (decision.outcome === "success") {
-        const chosen = decision.attachments.find((entry) => entry.chosen)?.chosen;
-        const provider = chosen?.provider?.trim();
-        const model = chosen?.model?.trim();
+        const chosen = attachments.find((entry: Record<string, unknown>) => entry.chosen) as
+          | Record<string, unknown>
+          | undefined;
+        const chosenData = chosen?.chosen as Record<string, unknown> | undefined;
+        const provider = (chosenData?.provider as string | undefined)?.trim();
+        const model = (chosenData?.model as string | undefined)?.trim();
         const modelLabel = provider ? (model ? `${provider}/${model}` : provider) : null;
         return `${decision.capability}${countLabel} ok${modelLabel ? ` (${modelLabel})` : ""}`;
       }
@@ -265,8 +270,12 @@ const formatMediaUnderstandingLine = (decisions?: MediaUnderstandingDecision[]) 
         return `${decision.capability} denied`;
       }
       if (decision.outcome === "skipped") {
-        const reason = decision.attachments
-          .flatMap((entry) => entry.attempts.map((attempt) => attempt.reason).filter(Boolean))
+        const reason = attachments
+          .flatMap((entry: Record<string, unknown>) =>
+            ((entry.attempts ?? []) as Array<Record<string, unknown>>)
+              .map((attempt: Record<string, unknown>) => attempt.reason as string | undefined)
+              .filter(Boolean),
+          )
           .find(Boolean);
         const shortReason = reason ? reason.split(":")[0]?.trim() : undefined;
         return `${decision.capability} skipped${shortReason ? ` (${shortReason})` : ""}`;
@@ -284,26 +293,10 @@ const formatMediaUnderstandingLine = (decisions?: MediaUnderstandingDecision[]) 
 };
 
 const formatVoiceModeLine = (
-  config?: OpenClawConfig,
-  sessionEntry?: SessionEntry,
+  _config?: FirstClawConfig,
+  _sessionEntry?: SessionEntry,
 ): string | null => {
-  if (!config) {
-    return null;
-  }
-  const ttsConfig = resolveTtsConfig(config);
-  const prefsPath = resolveTtsPrefsPath(ttsConfig);
-  const autoMode = resolveTtsAutoMode({
-    config: ttsConfig,
-    prefsPath,
-    sessionAuto: sessionEntry?.ttsAuto,
-  });
-  if (autoMode === "off") {
-    return null;
-  }
-  const provider = getTtsProvider(ttsConfig, prefsPath);
-  const maxLength = getTtsMaxLength(prefsPath);
-  const summarize = isSummarizationEnabled(prefsPath) ? "on" : "off";
-  return `🔊 Voice: ${autoMode} · provider=${provider} · limit=${maxLength} · summary=${summarize}`;
+  return null;
 };
 
 export function buildStatusMessage(args: StatusArgs): string {
@@ -314,7 +307,7 @@ export function buildStatusMessage(args: StatusArgs): string {
       agents: {
         defaults: args.agent ?? {},
       },
-    } as OpenClawConfig,
+    } as FirstClawConfig,
     defaultProvider: DEFAULT_PROVIDER,
     defaultModel: DEFAULT_MODEL,
   });
@@ -441,7 +434,7 @@ export function buildStatusMessage(args: StatusArgs): string {
   const authLabel = authLabelValue ? ` · 🔑 ${authLabelValue}` : "";
   const modelLine = `🧠 Model: ${modelLabel}${authLabel}`;
   const commit = resolveCommitHash();
-  const versionLine = `🦞 OpenClaw ${VERSION}${commit ? ` (${commit})` : ""}`;
+  const versionLine = `🦞 FirstClaw ${VERSION}${commit ? ` (${commit})` : ""}`;
   const usagePair = formatUsagePair(inputTokens, outputTokens);
   const costLine = costLabel ? `💵 Cost: ${costLabel}` : null;
   const usageCostLine =
@@ -503,7 +496,7 @@ function groupCommandsByCategory(
   return grouped;
 }
 
-export function buildHelpMessage(cfg?: OpenClawConfig): string {
+export function buildHelpMessage(cfg?: FirstClawConfig): string {
   const lines = ["ℹ️ Help", ""];
 
   lines.push("Session");
@@ -624,7 +617,7 @@ function formatCommandList(items: CommandsListItem[]): string {
 }
 
 export function buildCommandsMessage(
-  cfg?: OpenClawConfig,
+  cfg?: FirstClawConfig,
   skillCommands?: SkillCommandSpec[],
   options?: CommandsMessageOptions,
 ): string {
@@ -633,7 +626,7 @@ export function buildCommandsMessage(
 }
 
 export function buildCommandsMessagePaginated(
-  cfg?: OpenClawConfig,
+  cfg?: FirstClawConfig,
   skillCommands?: SkillCommandSpec[],
   options?: CommandsMessageOptions,
 ): CommandsMessageResult {

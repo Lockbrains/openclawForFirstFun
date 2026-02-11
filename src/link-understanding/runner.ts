@@ -1,16 +1,33 @@
 import type { MsgContext } from "../auto-reply/templating.js";
-import type { OpenClawConfig } from "../config/config.js";
+import type { FirstClawConfig } from "../config/config.js";
 import type { LinkModelConfig, LinkToolsConfig } from "../config/types.tools.js";
 import { applyTemplate } from "../auto-reply/templating.js";
 import { logVerbose, shouldLogVerbose } from "../globals.js";
-import { CLI_OUTPUT_MAX_BUFFER } from "../media-understanding/defaults.js";
-import { resolveTimeoutMs } from "../media-understanding/resolve.js";
-import {
-  normalizeMediaUnderstandingChatType,
-  resolveMediaUnderstandingScope,
-} from "../media-understanding/scope.js";
 import { runExec } from "../process/exec.js";
 import { DEFAULT_LINK_TIMEOUT_SECONDS } from "./defaults.js";
+
+const CLI_OUTPUT_MAX_BUFFER = 2 * 1024 * 1024;
+
+function resolveMediaUnderstandingScope(_params: {
+  scope?: unknown;
+  sessionKey?: string;
+  channel?: string;
+  chatType?: string;
+}): "allow" | "deny" {
+  return "allow";
+}
+
+function normalizeMediaUnderstandingChatType(chatType?: unknown): string {
+  return typeof chatType === "string" ? chatType : "unknown";
+}
+
+function resolveTimeoutMs(defaultSeconds: number, configuredSeconds?: number): number {
+  const sec =
+    typeof configuredSeconds === "number" && Number.isFinite(configuredSeconds)
+      ? configuredSeconds
+      : defaultSeconds;
+  return Math.max(1, Math.floor(sec)) * 1000;
+}
 import { extractLinksFromMessage } from "./detect.js";
 
 export type LinkUnderstandingResult = {
@@ -35,7 +52,7 @@ function resolveTimeoutMsFromConfig(params: {
   entry: LinkModelConfig;
 }): number {
   const configured = params.entry.timeoutSeconds ?? params.config?.timeoutSeconds;
-  return resolveTimeoutMs(configured, DEFAULT_LINK_TIMEOUT_SECONDS);
+  return resolveTimeoutMs(DEFAULT_LINK_TIMEOUT_SECONDS, configured);
 }
 
 async function runCliEntry(params: {
@@ -105,7 +122,7 @@ async function runLinkEntries(params: {
 }
 
 export async function runLinkUnderstanding(params: {
-  cfg: OpenClawConfig;
+  cfg: FirstClawConfig;
   ctx: MsgContext;
   message?: string;
 }): Promise<LinkUnderstandingResult> {

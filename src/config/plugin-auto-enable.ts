@@ -1,4 +1,4 @@
-import type { OpenClawConfig } from "./config.js";
+import type { FirstClawConfig } from "./config.js";
 import { normalizeProviderId } from "../agents/model-selection.js";
 import {
   getChannelPluginCatalogEntry,
@@ -10,7 +10,6 @@ import {
   normalizeChatChannelId,
 } from "../channels/registry.js";
 import { isRecord } from "../utils.js";
-import { hasAnyWhatsAppAuth } from "../web/accounts.js";
 
 type PluginEnableChange = {
   pluginId: string;
@@ -18,7 +17,7 @@ type PluginEnableChange = {
 };
 
 export type PluginAutoEnableResult = {
-  config: OpenClawConfig;
+  config: FirstClawConfig;
   changes: string[];
 };
 
@@ -63,7 +62,7 @@ function accountsHaveKeys(value: unknown, keys: string[]): boolean {
 }
 
 function resolveChannelConfig(
-  cfg: OpenClawConfig,
+  cfg: FirstClawConfig,
   channelId: string,
 ): Record<string, unknown> | null {
   const channels = cfg.channels as Record<string, unknown> | undefined;
@@ -71,7 +70,7 @@ function resolveChannelConfig(
   return isRecord(entry) ? entry : null;
 }
 
-function isTelegramConfigured(cfg: OpenClawConfig, env: NodeJS.ProcessEnv): boolean {
+function isTelegramConfigured(cfg: FirstClawConfig, env: NodeJS.ProcessEnv): boolean {
   if (hasNonEmptyString(env.TELEGRAM_BOT_TOKEN)) {
     return true;
   }
@@ -88,7 +87,7 @@ function isTelegramConfigured(cfg: OpenClawConfig, env: NodeJS.ProcessEnv): bool
   return recordHasKeys(entry);
 }
 
-function isDiscordConfigured(cfg: OpenClawConfig, env: NodeJS.ProcessEnv): boolean {
+function isDiscordConfigured(cfg: FirstClawConfig, env: NodeJS.ProcessEnv): boolean {
   if (hasNonEmptyString(env.DISCORD_BOT_TOKEN)) {
     return true;
   }
@@ -105,7 +104,7 @@ function isDiscordConfigured(cfg: OpenClawConfig, env: NodeJS.ProcessEnv): boole
   return recordHasKeys(entry);
 }
 
-function isIrcConfigured(cfg: OpenClawConfig, env: NodeJS.ProcessEnv): boolean {
+function isIrcConfigured(cfg: FirstClawConfig, env: NodeJS.ProcessEnv): boolean {
   if (hasNonEmptyString(env.IRC_HOST) && hasNonEmptyString(env.IRC_NICK)) {
     return true;
   }
@@ -122,7 +121,7 @@ function isIrcConfigured(cfg: OpenClawConfig, env: NodeJS.ProcessEnv): boolean {
   return recordHasKeys(entry);
 }
 
-function isSlackConfigured(cfg: OpenClawConfig, env: NodeJS.ProcessEnv): boolean {
+function isSlackConfigured(cfg: FirstClawConfig, env: NodeJS.ProcessEnv): boolean {
   if (
     hasNonEmptyString(env.SLACK_BOT_TOKEN) ||
     hasNonEmptyString(env.SLACK_APP_TOKEN) ||
@@ -147,7 +146,7 @@ function isSlackConfigured(cfg: OpenClawConfig, env: NodeJS.ProcessEnv): boolean
   return recordHasKeys(entry);
 }
 
-function isSignalConfigured(cfg: OpenClawConfig): boolean {
+function isSignalConfigured(cfg: FirstClawConfig): boolean {
   const entry = resolveChannelConfig(cfg, "signal");
   if (!entry) {
     return false;
@@ -167,7 +166,7 @@ function isSignalConfigured(cfg: OpenClawConfig): boolean {
   return recordHasKeys(entry);
 }
 
-function isIMessageConfigured(cfg: OpenClawConfig): boolean {
+function isIMessageConfigured(cfg: FirstClawConfig): boolean {
   const entry = resolveChannelConfig(cfg, "imessage");
   if (!entry) {
     return false;
@@ -178,30 +177,17 @@ function isIMessageConfigured(cfg: OpenClawConfig): boolean {
   return recordHasKeys(entry);
 }
 
-function isWhatsAppConfigured(cfg: OpenClawConfig): boolean {
-  if (hasAnyWhatsAppAuth(cfg)) {
-    return true;
-  }
-  const entry = resolveChannelConfig(cfg, "whatsapp");
-  if (!entry) {
-    return false;
-  }
-  return recordHasKeys(entry);
-}
-
-function isGenericChannelConfigured(cfg: OpenClawConfig, channelId: string): boolean {
+function isGenericChannelConfigured(cfg: FirstClawConfig, channelId: string): boolean {
   const entry = resolveChannelConfig(cfg, channelId);
   return recordHasKeys(entry);
 }
 
 export function isChannelConfigured(
-  cfg: OpenClawConfig,
+  cfg: FirstClawConfig,
   channelId: string,
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
   switch (channelId) {
-    case "whatsapp":
-      return isWhatsAppConfigured(cfg);
     case "telegram":
       return isTelegramConfigured(cfg, env);
     case "discord":
@@ -219,7 +205,7 @@ export function isChannelConfigured(
   }
 }
 
-function collectModelRefs(cfg: OpenClawConfig): string[] {
+function collectModelRefs(cfg: FirstClawConfig): string[] {
   const refs: string[] = [];
   const pushModelRef = (value: unknown) => {
     if (typeof value === "string" && value.trim()) {
@@ -273,7 +259,7 @@ function extractProviderFromModelRef(value: string): string | null {
   return normalizeProviderId(trimmed.slice(0, slash));
 }
 
-function isProviderConfigured(cfg: OpenClawConfig, providerId: string): boolean {
+function isProviderConfigured(cfg: FirstClawConfig, providerId: string): boolean {
   const normalized = normalizeProviderId(providerId);
 
   const profiles = cfg.auth?.profiles;
@@ -310,7 +296,7 @@ function isProviderConfigured(cfg: OpenClawConfig, providerId: string): boolean 
 }
 
 function resolveConfiguredPlugins(
-  cfg: OpenClawConfig,
+  cfg: FirstClawConfig,
   env: NodeJS.ProcessEnv,
 ): PluginEnableChange[] {
   const changes: PluginEnableChange[] = [];
@@ -346,12 +332,12 @@ function resolveConfiguredPlugins(
   return changes;
 }
 
-function isPluginExplicitlyDisabled(cfg: OpenClawConfig, pluginId: string): boolean {
+function isPluginExplicitlyDisabled(cfg: FirstClawConfig, pluginId: string): boolean {
   const entry = cfg.plugins?.entries?.[pluginId];
   return entry?.enabled === false;
 }
 
-function isPluginDenied(cfg: OpenClawConfig, pluginId: string): boolean {
+function isPluginDenied(cfg: FirstClawConfig, pluginId: string): boolean {
   const deny = cfg.plugins?.deny;
   return Array.isArray(deny) && deny.includes(pluginId);
 }
@@ -366,7 +352,7 @@ function resolvePreferredOverIds(pluginId: string): string[] {
 }
 
 function shouldSkipPreferredPluginAutoEnable(
-  cfg: OpenClawConfig,
+  cfg: FirstClawConfig,
   entry: PluginEnableChange,
   configured: PluginEnableChange[],
 ): boolean {
@@ -388,7 +374,7 @@ function shouldSkipPreferredPluginAutoEnable(
   return false;
 }
 
-function ensureAllowlisted(cfg: OpenClawConfig, pluginId: string): OpenClawConfig {
+function ensureAllowlisted(cfg: FirstClawConfig, pluginId: string): FirstClawConfig {
   const allow = cfg.plugins?.allow;
   if (!Array.isArray(allow) || allow.includes(pluginId)) {
     return cfg;
@@ -402,7 +388,7 @@ function ensureAllowlisted(cfg: OpenClawConfig, pluginId: string): OpenClawConfi
   };
 }
 
-function registerPluginEntry(cfg: OpenClawConfig, pluginId: string): OpenClawConfig {
+function registerPluginEntry(cfg: FirstClawConfig, pluginId: string): FirstClawConfig {
   const entries = {
     ...cfg.plugins?.entries,
     [pluginId]: {
@@ -430,7 +416,7 @@ function formatAutoEnableChange(entry: PluginEnableChange): string {
 }
 
 export function applyPluginAutoEnable(params: {
-  config: OpenClawConfig;
+  config: FirstClawConfig;
   env?: NodeJS.ProcessEnv;
 }): PluginAutoEnableResult {
   const env = params.env ?? process.env;

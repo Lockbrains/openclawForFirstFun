@@ -12,7 +12,7 @@ const ciWorkers = isWindows ? 2 : 3;
 export default defineConfig({
   resolve: {
     alias: {
-      "openclaw/plugin-sdk": path.join(repoRoot, "src", "plugin-sdk", "index.ts"),
+      "firstclaw/plugin-sdk": path.join(repoRoot, "src", "plugin-sdk", "index.ts"),
     },
   },
   test: {
@@ -28,7 +28,7 @@ export default defineConfig({
       "apps/macos/.build/**",
       "**/node_modules/**",
       "**/vendor/**",
-      "dist/OpenClaw.app/**",
+      "dist/FirstClaw.app/**",
       "**/*.live.test.ts",
       "**/*.e2e.test.ts",
     ],
@@ -61,7 +61,6 @@ export default defineConfig({
         "src/agents/sandbox.ts",
         "src/agents/skills-install.ts",
         "src/agents/pi-tool-definition-adapter.ts",
-        "src/agents/tools/discord-actions*.ts",
         "src/agents/tools/slack-actions.ts",
 
         // Gateway server integration surfaces are intentionally validated via manual/e2e runs.
