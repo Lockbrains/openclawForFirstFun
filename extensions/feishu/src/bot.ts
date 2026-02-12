@@ -519,6 +519,69 @@ export function parseFeishuMessageEvent(
   return ctx;
 }
 
+/**
+ * Check if the message text contains a text-based @mention of this agent's name.
+ *
+ * In Feishu groups, bots cannot natively @mention each other. To support multi-bot
+ * groups where each bot responds only when addressed by name, we check for "@AgentName"
+ * in the message text.
+ *
+ * - If explicit `mentionPatterns` are configured (per-agent or global groupChat config),
+ *   they are used as-is via the standard mention system (full regex flexibility).
+ * - Otherwise, auto-derives a strict "@Name" pattern from the agent identity,
+ *   requiring the @ prefix to prevent cross-triggering (e.g., "@BotA, tell BotB to..."
+ *   should NOT trigger BotB).
+ */
+function matchesFeishuTextMention(params: {
+  content: string;
+  cfg: ClawdbotConfig;
+  agentId: string;
+  core: ReturnType<typeof getFeishuRuntime>;
+}): boolean {
+  const { content, cfg, agentId, core } = params;
+  if (!content) return false;
+
+  // Check if explicit mentionPatterns are configured (per-agent or global).
+  // When explicit patterns exist, the user has full control over match strictness,
+  // so we use the standard mention system as-is.
+  const hasExplicit = hasExplicitMentionPatterns(cfg, agentId);
+  if (hasExplicit) {
+    const regexes = core.channel.mentions.buildMentionRegexes(cfg, agentId);
+    return core.channel.mentions.matchesMentionPatterns(content, regexes);
+  }
+
+  // No explicit patterns: auto-derive from agent identity but require @ prefix.
+  // Extract @-prefixed tokens from the text and check them against mention patterns.
+  // This ensures "FirstArt" appearing without @ does NOT trigger FirstArt's bot.
+  const regexes = core.channel.mentions.buildMentionRegexes(cfg, agentId);
+  if (regexes.length === 0) return false;
+
+  const atTokens = content.match(/@\S+/g);
+  if (!atTokens || atTokens.length === 0) return false;
+
+  return atTokens.some((token) =>
+    core.channel.mentions.matchesMentionPatterns(token, regexes),
+  );
+}
+
+/** Check whether the config has user-configured mentionPatterns (not auto-derived). */
+function hasExplicitMentionPatterns(cfg: ClawdbotConfig, agentId: string): boolean {
+  const agents = cfg.agents?.list;
+  if (Array.isArray(agents)) {
+    const agent = agents.find(
+      (a) => (a.id ?? "").toLowerCase() === (agentId ?? "").toLowerCase(),
+    );
+    if (agent?.groupChat && Object.hasOwn(agent.groupChat, "mentionPatterns")) {
+      return true;
+    }
+  }
+  const globalGroupChat = cfg.messages?.groupChat;
+  if (globalGroupChat && Object.hasOwn(globalGroupChat, "mentionPatterns")) {
+    return true;
+  }
+  return false;
+}
+
 export async function handleFeishuMessage(params: {
   cfg: ClawdbotConfig;
   event: FeishuMessageEvent;
@@ -582,6 +645,13 @@ export async function handleFeishuMessage(params: {
     feishuCfg?.historyLimit ?? cfg.messages?.groupChat?.historyLimit ?? DEFAULT_GROUP_HISTORY_LIMIT,
   );
 
+  // Resolve runtime early so we can do text-based mention matching in group chats.
+  const core = getFeishuRuntime();
+
+  // Track whether this agent was mentioned via text (for multi-bot groups where
+  // bots cannot natively @mention each other in Feishu).
+  let textMentioned = false;
+
   if (isGroup) {
     const groupPolicy = feishuCfg?.groupPolicy ?? "open";
     const groupAllowFrom = feishuCfg?.groupAllowFrom ?? [];
@@ -623,23 +693,44 @@ export async function handleFeishuMessage(params: {
     });
 
     if (requireMention && !ctx.mentionedBot) {
-      log(
-        `feishu[${account.accountId}]: message in group ${ctx.chatId} did not mention bot, recording to history`,
-      );
-      if (chatHistories) {
-        recordPendingHistoryEntryIfEnabled({
-          historyMap: chatHistories,
-          historyKey: ctx.chatId,
-          limit: historyLimit,
-          entry: {
-            sender: ctx.senderOpenId,
-            body: `${ctx.senderName ?? ctx.senderOpenId}: ${ctx.content}`,
-            timestamp: Date.now(),
-            messageId: ctx.messageId,
-          },
-        });
+      // Native @mention not detected — check for text-based @Name mention.
+      // This supports multi-bot Feishu groups where bots can't natively @mention
+      // each other but users can type "@BotName" as literal text.
+      const earlyRoute = core.channel.routing.resolveAgentRoute({
+        cfg,
+        channel: "feishu",
+        accountId: account.accountId,
+        peer: { kind: "group", id: ctx.chatId },
+      });
+      textMentioned = matchesFeishuTextMention({
+        content: ctx.content,
+        cfg,
+        agentId: earlyRoute.agentId,
+        core,
+      });
+
+      if (!textMentioned) {
+        log(
+          `feishu[${account.accountId}]: message in group ${ctx.chatId} did not mention bot, recording to history`,
+        );
+        if (chatHistories) {
+          recordPendingHistoryEntryIfEnabled({
+            historyMap: chatHistories,
+            historyKey: ctx.chatId,
+            limit: historyLimit,
+            entry: {
+              sender: ctx.senderOpenId,
+              body: `${ctx.senderName ?? ctx.senderOpenId}: ${ctx.content}`,
+              timestamp: Date.now(),
+              messageId: ctx.messageId,
+            },
+          });
+        }
+        return;
       }
-      return;
+      log(
+        `feishu[${account.accountId}]: text-based @mention detected for agent ${earlyRoute.agentId} in group ${ctx.chatId}`,
+      );
     }
   } else {
     const dmPolicy = feishuCfg?.dmPolicy ?? "pairing";
@@ -658,8 +749,6 @@ export async function handleFeishuMessage(params: {
   }
 
   try {
-    const core = getFeishuRuntime();
-
     // In group chats, the session is scoped to the group, but the *speaker* is the sender.
     // Using a group-scoped From causes the agent to treat different users as the same person.
     const feishuFrom = `feishu:${ctx.senderOpenId}`;
@@ -902,7 +991,7 @@ export async function handleFeishuMessage(params: {
       MessageSid: ctx.messageId,
       ReplyToBody: quotedContent ?? undefined,
       Timestamp: Date.now(),
-      WasMentioned: ctx.mentionedBot,
+      WasMentioned: ctx.mentionedBot || textMentioned,
       CommandAuthorized: true,
       OriginatingChannel: "feishu" as const,
       OriginatingTo: feishuTo,

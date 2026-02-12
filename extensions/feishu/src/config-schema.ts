@@ -96,6 +96,29 @@ const FeishuToolsConfigSchema = z
  */
 const TopicSessionModeSchema = z.enum(["disabled", "enabled"]).optional();
 
+/**
+ * Bot message polling configuration.
+ *
+ * Feishu's event subscription (`im.message.receive_v1`) only delivers messages
+ * from human users. Messages sent by other bots in the group are invisible to
+ * event-driven listeners. This polling mechanism uses `im.message.list` to
+ * periodically fetch recent messages (including bot-sent ones) and processes
+ * any that mention this agent by name.
+ *
+ * Use this to enable multi-bot collaboration in Feishu groups where bots on
+ * separate machines need to see each other's messages.
+ */
+const BotMessagePollingSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    /** Polling interval in milliseconds (default: 5000). */
+    intervalMs: z.number().int().positive().optional(),
+    /** Only poll these group chat IDs. Omit to poll all allowed groups. */
+    groups: z.array(z.string()).optional(),
+  })
+  .strict()
+  .optional();
+
 export const FeishuGroupSchema = z
   .object({
     requireMention: z.boolean().optional(),
@@ -180,6 +203,8 @@ export const FeishuConfigSchema = z
     tools: FeishuToolsConfigSchema,
     // Dynamic agent creation for DM users
     dynamicAgentCreation: DynamicAgentCreationSchema,
+    // Bot message polling for multi-bot group collaboration
+    botMessagePolling: BotMessagePollingSchema,
     // Multi-account configuration
     accounts: z.record(z.string(), FeishuAccountConfigSchema.optional()).optional(),
   })

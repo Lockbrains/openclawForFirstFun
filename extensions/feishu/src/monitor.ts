@@ -6,6 +6,7 @@ import { resolveFeishuAccount, listEnabledFeishuAccounts } from "./accounts.js";
 import { handleFeishuMessage, type FeishuMessageEvent, type FeishuBotAddedEvent } from "./bot.js";
 import { createFeishuWSClient, createEventDispatcher } from "./client.js";
 import { probeFeishu } from "./probe.js";
+import { startBotMessagePoller } from "./bot-message-poller.js";
 
 export type MonitorFeishuOpts = {
   config?: ClawdbotConfig;
@@ -122,6 +123,17 @@ async function monitorSingleAccount(params: MonitorAccountParams): Promise<void>
     runtime,
     chatHistories,
     fireAndForget: connectionMode === "webhook",
+  });
+
+  // Start bot message poller for multi-bot group collaboration.
+  // This picks up messages from other bots that Feishu's event system doesn't deliver.
+  startBotMessagePoller({
+    cfg,
+    account,
+    botOpenId: botOpenId ?? "",
+    runtime,
+    chatHistories,
+    abortSignal,
   });
 
   if (connectionMode === "webhook") {
