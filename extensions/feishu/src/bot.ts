@@ -609,24 +609,37 @@ export async function handleFeishuMessage(params: {
   let ctx = parseFeishuMessageEvent(event, botOpenId);
   const isGroup = ctx.chatType === "group";
 
+  // Detect if sender is another bot (app). Bot senders have sender_type === "app" and
+  // their ID is an app_id (cli_xxx) rather than an open_id (ou_xxx). We must NOT pass
+  // app IDs to user-facing Feishu APIs (contact.user.get, etc.) as they will error.
+  const isBotSender = event.sender.sender_type === "app";
+
   // Resolve sender display name (best-effort) so the agent can attribute messages correctly.
-  const senderResult = await resolveFeishuSenderName({
-    account,
-    senderOpenId: ctx.senderOpenId,
-    log,
-  });
-  if (senderResult.name) ctx = { ...ctx, senderName: senderResult.name };
-
-  // Track permission error to inform agent later (with cooldown to avoid repetition)
+  // Skip for bot senders — their ID is an app_id, not a user open_id.
   let permissionErrorForAgent: PermissionError | undefined;
-  if (senderResult.permissionError) {
-    const appKey = account.appId ?? "default";
-    const now = Date.now();
-    const lastNotified = permissionErrorNotifiedAt.get(appKey) ?? 0;
+  if (isBotSender) {
+    // For bot senders, use a descriptive label instead of calling the contacts API.
+    // Try to derive a name from mention metadata if available.
+    const botLabel = `bot:${ctx.senderOpenId}`;
+    ctx = { ...ctx, senderName: botLabel };
+  } else {
+    const senderResult = await resolveFeishuSenderName({
+      account,
+      senderOpenId: ctx.senderOpenId,
+      log,
+    });
+    if (senderResult.name) ctx = { ...ctx, senderName: senderResult.name };
 
-    if (now - lastNotified > PERMISSION_ERROR_COOLDOWN_MS) {
-      permissionErrorNotifiedAt.set(appKey, now);
-      permissionErrorForAgent = senderResult.permissionError;
+    // Track permission error to inform agent later (with cooldown to avoid repetition)
+    if (senderResult.permissionError) {
+      const appKey = account.appId ?? "default";
+      const now = Date.now();
+      const lastNotified = permissionErrorNotifiedAt.get(appKey) ?? 0;
+
+      if (now - lastNotified > PERMISSION_ERROR_COOLDOWN_MS) {
+        permissionErrorNotifiedAt.set(appKey, now);
+        permissionErrorForAgent = senderResult.permissionError;
+      }
     }
   }
 
