@@ -152,19 +152,25 @@ async function pollGroupChat(params: {
       // Only process messages from OTHER bots (sender_type === "app")
       if (item.sender?.sender_type !== "app") continue;
 
-      // Skip messages from THIS bot
+      // Skip messages from THIS bot — check both open_id and app_id formats.
+      // Feishu may return id_type "open_id" (ou_xxx) or "app_id" (cli_xxx) for bot senders.
       const senderOpenId = item.sender?.id_type === "open_id" ? item.sender?.id : undefined;
+      const senderAppId = item.sender?.id_type === "app_id" ? item.sender?.id : undefined;
       if (senderOpenId && senderOpenId === botOpenId) continue;
+      if (senderAppId && account.appId && senderAppId === account.appId) continue;
 
       processedPolledIds.add(msgId);
       prunePolledDedup();
       botMsgCount++;
 
-      // Construct a synthetic FeishuMessageEvent
+      // Construct a synthetic FeishuMessageEvent.
+      // Use the raw sender ID (which may be cli_xxx for bots) — handleFeishuMessage
+      // detects sender_type "app" and avoids passing it to user-only Feishu APIs.
+      const rawSenderId = senderOpenId ?? senderAppId ?? item.sender?.id ?? "";
       const syntheticEvent: FeishuMessageEvent = {
         sender: {
           sender_id: {
-            open_id: senderOpenId ?? item.sender?.id ?? "",
+            open_id: rawSenderId,
           },
           sender_type: "app",
           tenant_key: item.sender?.tenant_key,
@@ -190,7 +196,7 @@ async function pollGroupChat(params: {
       };
 
       log(
-        `feishu-poller[${account.accountId}]: processing bot message ${msgId} in ${chatId} from ${senderOpenId ?? "unknown-app"}`,
+        `feishu-poller[${account.accountId}]: processing bot message ${msgId} in ${chatId} from ${rawSenderId || "unknown-app"}`,
       );
 
       try {

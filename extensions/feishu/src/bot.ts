@@ -98,50 +98,21 @@ const senderNameCache = new Map<string, { name: string; expireAt: number }>();
 
 // Cache for resolving bot sender names via chat member list.
 // Key: "chatId:senderId", Value: resolved name.
-const botSenderNameCache = new Map<string, { name: string; expireAt: number }>();
 
 /**
- * Resolve a bot sender's display name by fetching the chat member list.
- * Falls back to "Agent" if the name cannot be resolved.
+ * Resolve a bot sender's display name.
+ *
+ * Feishu's chat members API explicitly excludes bot members from the response,
+ * so there is no reliable way to resolve another bot's display name via the API.
+ * Returns "Agent" as a clean generic label.
  */
-async function resolveFeishuBotSenderName(params: {
+function resolveFeishuBotSenderName(_params: {
   account: ResolvedFeishuAccount;
   chatId: string;
   senderAppId: string;
   log: (...args: any[]) => void;
-}): Promise<string> {
-  const { account, chatId, senderAppId, log } = params;
-  const cacheKey = `${chatId}:${senderAppId}`;
-  const now = Date.now();
-
-  const cached = botSenderNameCache.get(cacheKey);
-  if (cached && cached.expireAt > now) return cached.name;
-
-  try {
-    const client = createFeishuClient(account);
-    const res: any = await client.im.chatMembers.get({
-      path: { chat_id: chatId },
-      params: { member_id_type: "app_id", page_size: 100 },
-    });
-
-    const members = res?.data?.items ?? [];
-    for (const member of members) {
-      if (member.member_id === senderAppId || member.member_id_type === "app_id") {
-        const name = member.name ?? member.member_id;
-        if (name && name === member.name) {
-          botSenderNameCache.set(cacheKey, { name, expireAt: now + SENDER_NAME_TTL_MS });
-          return name;
-        }
-      }
-    }
-  } catch (err) {
-    log(`feishu: failed to resolve bot sender name for ${senderAppId}: ${String(err)}`);
-  }
-
-  // Fallback: use "Agent" as a clean generic label
-  const fallback = "Agent";
-  botSenderNameCache.set(cacheKey, { name: fallback, expireAt: now + SENDER_NAME_TTL_MS });
-  return fallback;
+}): string {
+  return "Agent";
 }
 
 // Cache permission errors to avoid spamming the user with repeated notifications.
@@ -666,9 +637,10 @@ export async function handleFeishuMessage(params: {
   // Skip for bot senders — their ID is an app_id, not a user open_id.
   let permissionErrorForAgent: PermissionError | undefined;
   if (isBotSender) {
-    // For bot senders, resolve display name via chat member list (best-effort).
-    // Do NOT use contact.user.get — bot app IDs (cli_xxx) are not user IDs.
-    const botName = await resolveFeishuBotSenderName({
+    // For bot senders, use a clean generic label.
+    // Do NOT call contact.user.get — bot app IDs (cli_xxx) are not user IDs
+    // and Feishu's chat members API excludes bot members.
+    const botName = resolveFeishuBotSenderName({
       account,
       chatId: ctx.chatId,
       senderAppId: ctx.senderOpenId,
@@ -990,7 +962,7 @@ export async function handleFeishuMessage(params: {
         agentId: route.agentId,
         runtime: runtime as RuntimeEnv,
         chatId: ctx.chatId,
-        replyToMessageId: ctx.messageId,
+        replyToMessageId: isBotSender ? undefined : ctx.messageId,
         accountId: account.accountId,
       });
 
@@ -1070,12 +1042,15 @@ export async function handleFeishuMessage(params: {
       ...mediaPayload,
     });
 
+    // For bot-sourced messages (from the poller), do NOT use replyToMessageId.
+    // Feishu may reject im.message.reply and im.messageReaction.create targeting
+    // another bot's message, causing 400 errors. Send as a new message instead.
     const { dispatcher, replyOptions, markDispatchIdle } = createFeishuReplyDispatcher({
       cfg,
       agentId: route.agentId,
       runtime: runtime as RuntimeEnv,
       chatId: ctx.chatId,
-      replyToMessageId: ctx.messageId,
+      replyToMessageId: isBotSender ? undefined : ctx.messageId,
       mentionTargets: ctx.mentionTargets,
       accountId: account.accountId,
     });
