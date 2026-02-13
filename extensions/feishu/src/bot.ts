@@ -96,6 +96,54 @@ function extractPermissionError(err: unknown): PermissionError | null {
 const SENDER_NAME_TTL_MS = 10 * 60 * 1000;
 const senderNameCache = new Map<string, { name: string; expireAt: number }>();
 
+// Cache for resolving bot sender names via chat member list.
+// Key: "chatId:senderId", Value: resolved name.
+const botSenderNameCache = new Map<string, { name: string; expireAt: number }>();
+
+/**
+ * Resolve a bot sender's display name by fetching the chat member list.
+ * Falls back to "Agent" if the name cannot be resolved.
+ */
+async function resolveFeishuBotSenderName(params: {
+  account: ResolvedFeishuAccount;
+  chatId: string;
+  senderAppId: string;
+  log: (...args: any[]) => void;
+}): Promise<string> {
+  const { account, chatId, senderAppId, log } = params;
+  const cacheKey = `${chatId}:${senderAppId}`;
+  const now = Date.now();
+
+  const cached = botSenderNameCache.get(cacheKey);
+  if (cached && cached.expireAt > now) return cached.name;
+
+  try {
+    const client = createFeishuClient(account);
+    const res: any = await client.im.chatMembers.get({
+      path: { chat_id: chatId },
+      params: { member_id_type: "app_id", page_size: 100 },
+    });
+
+    const members = res?.data?.items ?? [];
+    for (const member of members) {
+      if (member.member_id === senderAppId || member.member_id_type === "app_id") {
+        const name = member.name ?? member.member_id;
+        if (name && name === member.name) {
+          botSenderNameCache.set(cacheKey, { name, expireAt: now + SENDER_NAME_TTL_MS });
+          return name;
+        }
+      }
+    }
+  } catch (err) {
+    log(`feishu: failed to resolve bot sender name for ${senderAppId}: ${String(err)}`);
+  }
+
+  // Fallback: use "Agent" as a clean generic label
+  const fallback = "Agent";
+  botSenderNameCache.set(cacheKey, { name: fallback, expireAt: now + SENDER_NAME_TTL_MS });
+  return fallback;
+}
+
 // Cache permission errors to avoid spamming the user with repeated notifications.
 // Key: appId or "default", Value: timestamp of last notification
 const permissionErrorNotifiedAt = new Map<string, number>();
@@ -618,10 +666,15 @@ export async function handleFeishuMessage(params: {
   // Skip for bot senders — their ID is an app_id, not a user open_id.
   let permissionErrorForAgent: PermissionError | undefined;
   if (isBotSender) {
-    // For bot senders, use a descriptive label instead of calling the contacts API.
-    // Try to derive a name from mention metadata if available.
-    const botLabel = `bot:${ctx.senderOpenId}`;
-    ctx = { ...ctx, senderName: botLabel };
+    // For bot senders, resolve display name via chat member list (best-effort).
+    // Do NOT use contact.user.get — bot app IDs (cli_xxx) are not user IDs.
+    const botName = await resolveFeishuBotSenderName({
+      account,
+      chatId: ctx.chatId,
+      senderAppId: ctx.senderOpenId,
+      log,
+    });
+    ctx = { ...ctx, senderName: botName };
   } else {
     const senderResult = await resolveFeishuSenderName({
       account,
@@ -877,6 +930,12 @@ export async function handleFeishuMessage(params: {
     // (DMs already have per-sender sessions, but the prefix is still useful for clarity.)
     const speaker = ctx.senderName ?? ctx.senderOpenId;
     messageBody = `${speaker}: ${messageBody}`;
+
+    // For bot-sourced messages (from the poller), add a system hint so the agent
+    // treats the instruction as a real task requiring tool execution.
+    if (isBotSender && isGroup) {
+      messageBody += `\n\n[System: This message was sent by a collaborating agent (${speaker}) in the group chat. Treat it as a real task instruction — use your tools (exec, write, image, etc.) to complete the requested work. Do not just acknowledge; actually perform the task.]`;
+    }
 
     // If there are mention targets, inform the agent that replies will auto-mention them
     if (ctx.mentionTargets && ctx.mentionTargets.length > 0) {
