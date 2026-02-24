@@ -61,7 +61,8 @@ type TaskStatus =
   | "DONE"
   | "FAILED"
   | "TIMEOUT"
-  | "ABANDONED";
+  | "ABANDONED"
+  | "CANCELLED";
 
 interface TaskRecord {
   task_id: string;
@@ -466,6 +467,51 @@ function sendTaskResult(
   logger.info(`Result sent for task ${taskId} (${status}) → ${task.from}`);
 }
 
+function cancelTask(
+  cfg: ChatroomConfig,
+  taskId: string,
+  reason: string,
+  logger: Logger,
+): TaskRecord | null {
+  const task = readTaskRecord(cfg, taskId);
+  if (!task) return null;
+
+  const terminalStatuses: TaskStatus[] = ["DONE", "FAILED", "ABANDONED", "CANCELLED"];
+  if (terminalStatuses.includes(task.status)) return task;
+
+  updateTaskRecord(cfg, taskId, {
+    status: "CANCELLED",
+    completed_at: nowISO(),
+    result_summary: `Cancelled: ${reason}`.slice(0, 500),
+  });
+
+  sendMessageToNAS(
+    cfg,
+    task.channel_id,
+    `[SYSTEM] Task ${taskId} cancelled by ${cfg.agentId}. Reason: ${reason}`,
+    "SYSTEM",
+    [task.to],
+    undefined,
+    { task_id: taskId, status: "CANCELLED" },
+  );
+
+  resetAgentStatus(cfg, task.to, logger);
+  logger.info(`Task ${taskId} cancelled (was ${task.status}) → ${task.to}`);
+  return { ...task, status: "CANCELLED", completed_at: nowISO() };
+}
+
+function resetAgentStatus(cfg: ChatroomConfig, agentId: string, logger: Logger): void {
+  const regPath = path.join(chatroomRoot(cfg), "registry", `${agentId}.json`);
+  const info = readJson(regPath);
+  if (!info) return;
+  if (info.status === "working" || info.status === "waiting") {
+    info.status = "idle";
+    info.current_task = null;
+    writeJson(regPath, info);
+    logger.info(`Reset ${agentId} status to idle`);
+  }
+}
+
 // ============================================================================
 // Daemon message handlers — route by message type
 // ============================================================================
@@ -625,7 +671,7 @@ function monitorPendingTasks(cfg: ChatroomConfig, logger: Logger): void {
 // Orchestration context
 // ============================================================================
 
-function buildChatroomContext(cfg: ChatroomConfig): string {
+function buildChatroomContext(cfg: ChatroomConfig, sourceChannel?: string): string {
   const agents = readAgentRegistry(cfg);
   const channels = listAgentChannels(cfg);
 
@@ -637,19 +683,32 @@ function buildChatroomContext(cfg: ChatroomConfig): string {
 
   const lines: string[] = [
     `[Chatroom Orchestration Context]`,
-    `You are "${cfg.agentId}". Your role depends on context:`,
+    `You are "${cfg.agentId}", the Orchestrator of the First Agent Family.`,
     ``,
-    `File system (NAS):`,
+    `═══ CHANNEL RULES (MUST follow) ═══`,
+    `  #general   → Human ↔ Orchestrator communication ONLY.`,
+    `               When a human sends a message here, respond HERE and nowhere else.`,
+    `               Do NOT post task results, progress updates, or agent replies to #general.`,
+    `  #pipeline  → Pipeline status updates and progress summaries.`,
+    `               Post stage progress (e.g. "Stage 1 complete, moving to Stage 2") here.`,
+    `               Post final delivery summaries here when a full pipeline completes.`,
+    `  dm_{agent} → Private task channels between you and a specific agent.`,
+    `               Task dispatch and result delivery happen here automatically via the protocol.`,
+    `               Do NOT manually send messages to DM channels — the system handles it.`,
+    ``,
+    `  CRITICAL: Your response goes to the SAME channel as the incoming message.`,
+    sourceChannel ? `  Current channel: #${sourceChannel}` : ``,
+    ``,
+    `═══ File System (NAS) ═══`,
     `  Your output dir: ${myAssets}`,
     `  Shared dir: ${sharedAssets}`,
     `  All agent assets: ${assetsDir(cfg)}`,
     `  When dispatching a task, the system auto-creates an output dir for the target.`,
-    `  The target agent receives the path in metadata.output_dir.`,
     ``,
   ];
 
   if (otherAgents.length > 0) {
-    lines.push(`Available agents:`);
+    lines.push(`═══ Available Agents ═══`);
     for (const a of otherAgents) {
       const dmChannel = `dm_${a.agent_id}`;
       const hasDM = channels.some((ch) => ch.channel_id === dmChannel);
@@ -660,20 +719,23 @@ function buildChatroomContext(cfg: ChatroomConfig): string {
     lines.push(``);
   }
 
-  lines.push(`Task dispatch protocol:`);
-  lines.push(`  When you need another agent to perform work, use the chatroom_dispatch_task tool.`);
-  lines.push(`  This sends a formal TASK_DISPATCH with guaranteed delivery + ACK handshake.`);
-  lines.push(`  The target agent will auto-ACK and begin processing immediately.`);
+  lines.push(`═══ Task Dispatch Protocol ═══`);
+  lines.push(`  Use chatroom_dispatch_task to assign work to agents.`);
+  lines.push(`  The system handles: DM delivery → ACK → result collection.`);
   lines.push(`  Output files are placed in: ${assetsDir(cfg)}/{agent_id}/{task_id}/`);
   lines.push(``);
-  lines.push(`  chatroom_dispatch_task(target="art", instruction="draw a steel dinosaur")`);
+  lines.push(
+    `  Example: chatroom_dispatch_task(target="art", instruction="draw a steel dinosaur")`,
+  );
   lines.push(``);
-  lines.push(`  For general chat, use chatroom_send_message instead.`);
+  lines.push(`═══ File Sharing ═══`);
+  lines.push(`  To send a file as a chat message: use chatroom_send_file.`);
+  lines.push(`  To save a file without sending a message: use chatroom_save_asset.`);
   lines.push(``);
 
   const activeTasks = listTasksByStatus(cfg, "DISPATCHED", "ACKED", "PROCESSING");
   if (activeTasks.length > 0) {
-    lines.push(`Active tasks:`);
+    lines.push(`═══ Active Tasks ═══`);
     for (const t of activeTasks) {
       lines.push(
         `  - [${t.status}] ${t.task_id.slice(0, 8)}... → ${t.to}: "${t.instruction.slice(0, 60)}"`,
@@ -709,7 +771,7 @@ async function autoDispatchMessage(
     ? `[Human] ${msg.from.slice("human:".length)}`
     : msg.from;
 
-  const chatroomContext = buildChatroomContext(chatroomCfg);
+  const chatroomContext = buildChatroomContext(chatroomCfg, channelId);
   const messageBody = `[Chatroom #${channelId}] ${senderLabel}: ${msg.content.text}`;
   const bodyForAgent = chatroomContext ? `${chatroomContext}\n${messageBody}` : messageBody;
 
@@ -801,15 +863,18 @@ async function autoDispatchForTask(
     msg.content.text,
     ``,
     `RULES (MUST follow — violations break the pipeline):`,
-    `1. SAVE all output files using the chatroom_save_asset tool with task_id="${taskId}".`,
+    `1. SAVE all output files using chatroom_save_asset with task_id="${taskId}".`,
     `   This stores them in the correct NAS directory: ${outputDir}`,
-    `   Example: chatroom_save_asset(filename="output.png", content="<base64>", encoding="base64", task_id="${taskId}")`,
-    `2. Your final TEXT RESPONSE is your task result.`,
-    `   The system AUTOMATICALLY delivers it to the orchestrator.`,
-    `3. DO NOT send results via Lark, Feishu, or any other messaging channel.`,
+    `   For binary files (images, audio): chatroom_save_asset(filename="output.png", content="<base64>", encoding="base64", task_id="${taskId}")`,
+    `   For text files: chatroom_save_asset(filename="report.md", content="...", task_id="${taskId}")`,
+    `2. To share files visually (so others can see images/download files), use chatroom_send_file:`,
+    `   chatroom_send_file(channel_id="${msg.channel_id}", filename="output.png", content="<base64>", encoding="base64", task_id="${taskId}")`,
+    `3. Your final TEXT RESPONSE is your task result.`,
+    `   The system AUTOMATICALLY delivers it as a RESULT_REPORT to the orchestrator.`,
+    `4. DO NOT send results via Lark, Feishu, or any other messaging channel.`,
     `   DO NOT call feishu tools, reply tools, or any messaging/notification tools.`,
     `   DO NOT attempt to notify anyone manually — the system handles ALL delivery.`,
-    `4. Mention produced filenames in your text response so the orchestrator knows what was created.`,
+    `5. Mention produced filenames in your text response so the orchestrator knows what was created.`,
   ].join("\n");
 
   const ctxPayload = runtime.channel.reply.finalizeInboundContext({
@@ -1022,6 +1087,71 @@ const agentChatroomPlugin = {
       { names: ["chatroom_task_status"] },
     );
 
+    // ── Tool: cancel / terminate a task ──────────────────────────────────
+
+    api.registerTool(
+      {
+        name: "chatroom_cancel_task",
+        label: "Chatroom: Cancel Task",
+        description:
+          "Cancel an active task. Use this when:\n" +
+          "  - A task is stuck (agent cannot complete it)\n" +
+          "  - You want to reassign the work to a different agent\n" +
+          "  - The task is no longer needed\n" +
+          "Sets the task status to CANCELLED, notifies the target agent, and resets their status to idle.",
+        parameters: Type.Object({
+          task_id: Type.String({ description: "The task ID to cancel" }),
+          reason: Type.Optional(
+            Type.String({ description: "Why the task is being cancelled (shown to the agent)" }),
+          ),
+        }),
+        async execute(_toolCallId, params) {
+          try {
+            const p = params as { task_id: string; reason?: string };
+            const reason = p.reason ?? "Cancelled by orchestrator";
+            const result = cancelTask(cfg, p.task_id, reason, logger);
+            if (!result) {
+              return {
+                content: [{ type: "text" as const, text: `Task ${p.task_id} not found.` }],
+                details: undefined,
+              };
+            }
+            if (result.status !== "CANCELLED") {
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: `Task ${p.task_id} is already in terminal state: ${result.status}. No action taken.`,
+                  },
+                ],
+                details: result,
+              };
+            }
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text:
+                    `Task ${p.task_id} cancelled.\n` +
+                    `  Target: ${result.to}\n` +
+                    `  Previous status: ${result.status}\n` +
+                    `  Reason: ${reason}\n` +
+                    `  Agent ${result.to} status reset to idle.`,
+                },
+              ],
+              details: result,
+            };
+          } catch (err) {
+            return {
+              content: [{ type: "text" as const, text: `Error: ${err}` }],
+              details: undefined,
+            };
+          }
+        },
+      },
+      { names: ["chatroom_cancel_task"] },
+    );
+
     // ── Tool: save asset to NAS ───────────────────────────────────────────
 
     api.registerTool(
@@ -1101,7 +1231,8 @@ const agentChatroomPlugin = {
         label: "Chatroom: Send Message",
         description:
           "Send a general chat message to a channel. For task assignments, use chatroom_dispatch_task instead.\n" +
-          "Use this for: status updates, questions, broadcasting information, chatting.",
+          "Use this for: status updates, questions, broadcasting information, chatting.\n" +
+          "Optionally attach files already saved on NAS via asset_paths.",
         parameters: Type.Object({
           channel_id: Type.String({
             description: "Target channel ID (e.g. 'general', 'pipeline', 'dm_art')",
@@ -1110,16 +1241,38 @@ const agentChatroomPlugin = {
           mentions: Type.Optional(
             Type.Array(Type.String(), { description: "Agent IDs to @mention" }),
           ),
+          asset_paths: Type.Optional(
+            Type.Array(Type.String(), {
+              description: "NAS file paths to attach (e.g. from chatroom_save_asset output)",
+            }),
+          ),
         }),
         async execute(_toolCallId, params) {
           try {
-            const p = params as { channel_id: string; text: string; mentions?: string[] };
-            const result = sendMessageToNAS(cfg, p.channel_id, p.text, "CHAT", p.mentions ?? []);
+            const p = params as {
+              channel_id: string;
+              text: string;
+              mentions?: string[];
+              asset_paths?: string[];
+            };
+            const metadata: Record<string, any> = {};
+            if (p.asset_paths?.length) metadata.asset_paths = p.asset_paths;
+            const result = sendMessageToNAS(
+              cfg,
+              p.channel_id,
+              p.text,
+              "CHAT",
+              p.mentions ?? [],
+              undefined,
+              metadata,
+            );
             return {
               content: [
                 {
                   type: "text" as const,
-                  text: `Message sent to #${p.channel_id} (seq: ${result.seq})`,
+                  text:
+                    `Message sent to #${p.channel_id} (seq: ${result.seq})` +
+                    (p.asset_paths?.length ? ` with ${p.asset_paths.length} attachment(s)` : ""),
                 },
               ],
               details: result,
@@ -1133,6 +1286,95 @@ const agentChatroomPlugin = {
         },
       },
       { names: ["chatroom_send_message"] },
+    );
+
+    // ── Tool: upload file and send as message ────────────────────────────────
+
+    api.registerTool(
+      {
+        name: "chatroom_send_file",
+        label: "Chatroom: Upload & Send File",
+        description:
+          "Upload a file to NAS and send it as a chat message in one step.\n" +
+          "The file is saved to your agent's asset directory and a message with the file " +
+          "attached is posted to the specified channel.\n" +
+          "Images will be displayed inline in the chatroom UI. Other files appear as download links.\n" +
+          "For binary files (images, audio, etc.), set encoding to 'base64'.",
+        parameters: Type.Object({
+          channel_id: Type.String({
+            description: "Target channel ID (e.g. 'general', 'pipeline')",
+          }),
+          filename: Type.String({
+            description: "File name with extension (e.g. 'concept_art.png', 'report.md')",
+          }),
+          content: Type.String({
+            description:
+              "File content — plain text for text files, base64-encoded string for binary files",
+          }),
+          encoding: Type.Optional(
+            Type.String({
+              description: "'text' (default) or 'base64' for binary files like images",
+            }),
+          ),
+          text: Type.Optional(
+            Type.String({
+              description: "Optional message text to accompany the file. Defaults to the filename.",
+            }),
+          ),
+          task_id: Type.Optional(
+            Type.String({
+              description: "If part of a task, saves to the task-specific directory.",
+            }),
+          ),
+        }),
+        async execute(_toolCallId, params) {
+          try {
+            const p = params as {
+              channel_id: string;
+              filename: string;
+              content: string;
+              encoding?: string;
+              text?: string;
+              task_id?: string;
+            };
+            const dir = p.task_id
+              ? taskAssetsDir(cfg, cfg.agentId, p.task_id)
+              : assetsDir(cfg, cfg.agentId);
+            ensureDir(dir);
+            const filePath = path.join(dir, p.filename);
+
+            if (p.encoding === "base64") {
+              fs.writeFileSync(filePath, Buffer.from(p.content, "base64"));
+            } else {
+              fs.writeFileSync(filePath, p.content, "utf-8");
+            }
+
+            const fileSize = fs.statSync(filePath).size;
+            const msgText = p.text ?? `📎 ${p.filename}`;
+            const result = sendMessageToNAS(cfg, p.channel_id, msgText, "CHAT", [], undefined, {
+              asset_paths: [filePath],
+            });
+
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text:
+                    `File uploaded and message sent to #${p.channel_id} (seq: ${result.seq})\n` +
+                    `  Path: ${filePath} (${fileSize} bytes)`,
+                },
+              ],
+              details: { path: filePath, size: fileSize, seq: result.seq },
+            };
+          } catch (err) {
+            return {
+              content: [{ type: "text" as const, text: `Error: ${err}` }],
+              details: undefined,
+            };
+          }
+        },
+      },
+      { names: ["chatroom_send_file"] },
     );
 
     // ── Tool: list channels ─────────────────────────────────────────────────
