@@ -90,6 +90,8 @@ export type EmbeddedRunAttemptParams = {
   streamParams?: AgentStreamParams;
   ownerNumbers?: string[];
   enforceFinalTag?: boolean;
+  /** Block tools matching these names during this run. Supports trailing wildcards (e.g. "feishu_*"). */
+  toolsDeny?: string[];
 };
 
 export type EmbeddedRunAttemptResult = {

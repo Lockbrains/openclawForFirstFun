@@ -240,7 +240,18 @@ export async function runEmbeddedAttempt(
             params.requireExplicitMessageTarget ?? isSubagentSessionKey(params.sessionKey),
           disableMessageTool: params.disableMessageTool,
         });
-    const tools = sanitizeToolsForGoogle({ tools: toolsRaw, provider: params.provider });
+    const toolsSanitized = sanitizeToolsForGoogle({ tools: toolsRaw, provider: params.provider });
+    const tools = params.toolsDeny?.length
+      ? toolsSanitized.filter((t) => {
+          const name = (t as { name?: string }).name;
+          if (!name) {
+            return true;
+          }
+          return !params.toolsDeny!.some((pattern) =>
+            pattern.endsWith("*") ? name.startsWith(pattern.slice(0, -1)) : name === pattern,
+          );
+        })
+      : toolsSanitized;
     logToolSchemasForGoogle({ tools, provider: params.provider });
 
     const machineName = await getMachineDisplayName();

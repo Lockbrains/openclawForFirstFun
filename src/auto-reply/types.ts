@@ -41,6 +41,8 @@ export type GetReplyOptions = {
   skillFilter?: string[];
   /** Mutable ref to track if a reply was sent (for Slack "first" threading mode). */
   hasRepliedRef?: { value: boolean };
+  /** Block tools matching these names during this dispatch. Supports trailing wildcards (e.g. "feishu_*"). */
+  toolsDeny?: string[];
 };
 
 export type ReplyPayload = {

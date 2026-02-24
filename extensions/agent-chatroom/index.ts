@@ -792,13 +792,24 @@ async function autoDispatchForTask(
   ensureDir(outputDir as string);
 
   const taskContext = [
-    `[Task Assignment]`,
-    `You have been assigned task ${taskId} by ${msg.from}.`,
-    `Instruction: ${msg.content.text}`,
+    `[CHATROOM TASK — STRICT PROTOCOL]`,
+    `task_id: ${taskId}`,
+    `assigned_by: ${msg.from}`,
+    `output_dir: ${outputDir}`,
     ``,
-    `File output directory: ${outputDir}`,
-    `Save any files/assets you produce to this directory on the NAS.`,
-    `When done, your text response will be sent back as the task result.`,
+    `INSTRUCTION:`,
+    msg.content.text,
+    ``,
+    `RULES (MUST follow — violations break the pipeline):`,
+    `1. SAVE all output files using the chatroom_save_asset tool with task_id="${taskId}".`,
+    `   This stores them in the correct NAS directory: ${outputDir}`,
+    `   Example: chatroom_save_asset(filename="output.png", content="<base64>", encoding="base64", task_id="${taskId}")`,
+    `2. Your final TEXT RESPONSE is your task result.`,
+    `   The system AUTOMATICALLY delivers it to the orchestrator.`,
+    `3. DO NOT send results via Lark, Feishu, or any other messaging channel.`,
+    `   DO NOT call feishu tools, reply tools, or any messaging/notification tools.`,
+    `   DO NOT attempt to notify anyone manually — the system handles ALL delivery.`,
+    `4. Mention produced filenames in your text response so the orchestrator knows what was created.`,
   ].join("\n");
 
   const ctxPayload = runtime.channel.reply.finalizeInboundContext({
@@ -854,7 +865,10 @@ async function autoDispatchForTask(
     ctx: ctxPayload,
     cfg: config,
     dispatcherOptions,
-    replyOptions: { onModelSelected: prefixContext.onModelSelected },
+    replyOptions: {
+      onModelSelected: prefixContext.onModelSelected,
+      toolsDeny: ["message", "feishu_*", "lark_*"],
+    },
   });
 }
 
@@ -1006,6 +1020,77 @@ const agentChatroomPlugin = {
         },
       },
       { names: ["chatroom_task_status"] },
+    );
+
+    // ── Tool: save asset to NAS ───────────────────────────────────────────
+
+    api.registerTool(
+      {
+        name: "chatroom_save_asset",
+        label: "Chatroom: Save Asset",
+        description:
+          "Save a file to the NAS shared storage. Use this when completing a task to ensure " +
+          "your output is stored in the correct location.\n" +
+          "The file will be saved to your agent's asset directory on the NAS.\n" +
+          "Provide the content as text (for text files) or base64 (for binary files).",
+        parameters: Type.Object({
+          filename: Type.String({
+            description: "File name (e.g. 'steel_dinosaur.png', 'report.md')",
+          }),
+          content: Type.String({
+            description:
+              "File content — plain text for text files, base64-encoded string for binary files",
+          }),
+          encoding: Type.Optional(
+            Type.String({
+              description: "'text' (default) or 'base64' for binary files",
+            }),
+          ),
+          task_id: Type.Optional(
+            Type.String({
+              description:
+                "Task ID — saves to the task-specific output directory. If omitted, saves to your general agent directory.",
+            }),
+          ),
+        }),
+        async execute(_toolCallId, params) {
+          try {
+            const p = params as {
+              filename: string;
+              content: string;
+              encoding?: string;
+              task_id?: string;
+            };
+            const dir = p.task_id
+              ? taskAssetsDir(cfg, cfg.agentId, p.task_id)
+              : assetsDir(cfg, cfg.agentId);
+            ensureDir(dir);
+            const filePath = path.join(dir, p.filename);
+
+            if (p.encoding === "base64") {
+              fs.writeFileSync(filePath, Buffer.from(p.content, "base64"));
+            } else {
+              fs.writeFileSync(filePath, p.content, "utf-8");
+            }
+
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `File saved: ${filePath} (${fs.statSync(filePath).size} bytes)`,
+                },
+              ],
+              details: { path: filePath, size: fs.statSync(filePath).size },
+            };
+          } catch (err) {
+            return {
+              content: [{ type: "text" as const, text: `Error saving file: ${err}` }],
+              details: undefined,
+            };
+          }
+        },
+      },
+      { names: ["chatroom_save_asset"] },
     );
 
     // ── Tool: send message (general chat, non-task) ─────────────────────────

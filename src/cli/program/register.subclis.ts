@@ -239,6 +239,14 @@ const entries: SubCliEntry[] = [
       mod.registerCompletionCli(program);
     },
   },
+  {
+    name: "register",
+    description: "Register a new agent in the Agent Family chatroom",
+    register: async (program) => {
+      const mod = await import("../register-cli.js");
+      mod.registerRegisterCli(program);
+    },
+  },
 ];
 
 export function getSubCliEntries(): SubCliEntry[] {
