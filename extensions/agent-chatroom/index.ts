@@ -4,10 +4,19 @@
  * Provides:
  *   1. Tools for LLM agents to interact with the multi-agent chatroom.
  *   2. A background daemon that polls the NAS inbox and **automatically
- *      dispatches** incoming messages through the LLM — so the agent
- *      responds without anyone calling a tool first.
- *   3. Orchestration context injection so the LLM knows how to dispatch
- *      tasks to other agents via chatroom channels.
+ *      dispatches** incoming messages through the LLM.
+ *   3. A reliable **Task Dispatch Protocol** with system-level ACK handshake:
+ *
+ *        Orchestrator                Target Agent
+ *             │                           │
+ *             │── TASK_DISPATCH ─────────>│  ① assign task
+ *             │                           │
+ *             │<── TASK_ACK (system) ─────│  ② instant ACK (no LLM)
+ *             │                           │
+ *             │    [LLM processes task]   │
+ *             │                           │
+ *             │<── RESULT_REPORT ─────────│  ③ deliver result
+ *             │                           │
  */
 
 import type { FirstClawPluginApi } from "firstclaw/plugin-sdk";
@@ -15,6 +24,69 @@ import { Type } from "@sinclair/typebox";
 import { createReplyPrefixContext, type ReplyPayload } from "firstclaw/plugin-sdk";
 import * as fs from "node:fs";
 import * as path from "node:path";
+
+// ============================================================================
+// Types
+// ============================================================================
+
+interface ChatroomConfig {
+  nasRoot: string;
+  agentId: string;
+  localDir: string;
+}
+
+interface AgentRegistryEntry {
+  agent_id: string;
+  display_name: string;
+  type: string;
+  status: string;
+  channels: string[];
+}
+
+interface InboxMessage {
+  message_id: string;
+  channel_id: string;
+  from: string;
+  type: string;
+  content: { text: string; mentions: string[] };
+  timestamp: string;
+  seq: number;
+  metadata?: Record<string, any>;
+}
+
+type TaskStatus =
+  | "DISPATCHED"
+  | "ACKED"
+  | "PROCESSING"
+  | "DONE"
+  | "FAILED"
+  | "TIMEOUT"
+  | "ABANDONED";
+
+interface TaskRecord {
+  task_id: string;
+  from: string;
+  to: string;
+  channel_id: string;
+  status: TaskStatus;
+  instruction: string;
+  dispatched_at: string;
+  acked_at: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  result_summary: string | null;
+  asset_paths: string[];
+  retries: number;
+  max_retries: number;
+  ack_timeout_ms: number;
+  task_timeout_ms: number;
+}
+
+interface Logger {
+  info: (...a: any[]) => void;
+  warn: (...a: any[]) => void;
+  error: (...a: any[]) => void;
+}
 
 // ============================================================================
 // NAS file helpers
@@ -45,7 +117,7 @@ function nowISO(): string {
 }
 
 // ============================================================================
-// File lock (matches Python SDK behaviour)
+// File lock
 // ============================================================================
 
 function acquireLock(lockPath: string, holder: string, timeoutSec = 30, retries = 5): boolean {
@@ -71,11 +143,9 @@ function acquireLock(lockPath: string, holder: string, timeoutSec = 30, retries 
       } catch {
         /* ignore */
       }
-
       if (i < retries - 1) {
-        const waitMs = 1000;
         const start = Date.now();
-        while (Date.now() - start < waitMs) {
+        while (Date.now() - start < 1000) {
           /* busy wait */
         }
       }
@@ -96,22 +166,12 @@ function releaseLock(lockPath: string): void {
 // Core chatroom operations
 // ============================================================================
 
-interface ChatroomConfig {
-  nasRoot: string;
-  agentId: string;
-  localDir: string;
-}
-
-interface AgentRegistryEntry {
-  agent_id: string;
-  display_name: string;
-  type: string;
-  status: string;
-  channels: string[];
-}
-
 function chatroomRoot(cfg: ChatroomConfig): string {
   return path.join(cfg.nasRoot, "chatroom");
+}
+
+function tasksDir(cfg: ChatroomConfig): string {
+  return path.join(chatroomRoot(cfg), "tasks");
 }
 
 function readAgentRegistry(cfg: ChatroomConfig): AgentRegistryEntry[] {
@@ -179,7 +239,6 @@ function sendMessageToNAS(
     meta.message_count = (meta.message_count ?? 0) + 1;
     writeJson(metaPath, meta);
 
-    // Notify channel members + explicitly mentioned agents
     const members: string[] = meta.members ?? [];
     const notifySet = new Set(members);
     for (const m of mentions) notifySet.add(m);
@@ -229,17 +288,6 @@ function updateHeartbeat(cfg: ChatroomConfig): void {
   writeJson(regPath, info);
 }
 
-interface InboxMessage {
-  message_id: string;
-  channel_id: string;
-  from: string;
-  type: string;
-  content: { text: string; mentions: string[] };
-  timestamp: string;
-  seq: number;
-  metadata?: Record<string, any>;
-}
-
 function pollInbox(cfg: ChatroomConfig): InboxMessage[] {
   const root = chatroomRoot(cfg);
   const inboxDir = path.join(root, "inbox", cfg.agentId);
@@ -259,9 +307,8 @@ function pollInbox(cfg: ChatroomConfig): InboxMessage[] {
 
       const msgDir = path.join(root, "channels", notif.channel_id, "messages");
       if (fs.existsSync(msgDir)) {
-        const msgFiles = fs
-          .readdirSync(msgDir)
-          .filter((f) => f.startsWith(String(notif.message_seq).padStart(6, "0")));
+        const prefix = String(notif.message_seq).padStart(6, "0");
+        const msgFiles = fs.readdirSync(msgDir).filter((f) => f.startsWith(prefix));
         if (msgFiles.length > 0) {
           const fullMsg = readJson(path.join(msgDir, msgFiles[0]));
           if (fullMsg) messages.push(fullMsg);
@@ -277,7 +324,283 @@ function pollInbox(cfg: ChatroomConfig): InboxMessage[] {
 }
 
 // ============================================================================
-// Orchestration context: tell the LLM what agents / channels exist
+// Task Registry — persistent task state on NAS
+// ============================================================================
+
+function createTaskRecord(
+  cfg: ChatroomConfig,
+  to: string,
+  channelId: string,
+  instruction: string,
+  opts?: { ackTimeoutMs?: number; taskTimeoutMs?: number; maxRetries?: number },
+): TaskRecord {
+  const dir = tasksDir(cfg);
+  ensureDir(dir);
+
+  const task: TaskRecord = {
+    task_id: randomUUID(),
+    from: cfg.agentId,
+    to,
+    channel_id: channelId,
+    status: "DISPATCHED",
+    instruction,
+    dispatched_at: nowISO(),
+    acked_at: null,
+    started_at: null,
+    completed_at: null,
+    result_summary: null,
+    asset_paths: [],
+    retries: 0,
+    max_retries: opts?.maxRetries ?? 3,
+    ack_timeout_ms: opts?.ackTimeoutMs ?? 30_000,
+    task_timeout_ms: opts?.taskTimeoutMs ?? 600_000,
+  };
+
+  writeJson(path.join(dir, `${task.task_id}.json`), task);
+  return task;
+}
+
+function readTaskRecord(cfg: ChatroomConfig, taskId: string): TaskRecord | null {
+  return readJson(path.join(tasksDir(cfg), `${taskId}.json`));
+}
+
+function updateTaskRecord(cfg: ChatroomConfig, taskId: string, patch: Partial<TaskRecord>): void {
+  const filePath = path.join(tasksDir(cfg), `${taskId}.json`);
+  const existing = readJson(filePath);
+  if (!existing) return;
+  writeJson(filePath, { ...existing, ...patch });
+}
+
+function listTasksByStatus(cfg: ChatroomConfig, ...statuses: TaskStatus[]): TaskRecord[] {
+  const dir = tasksDir(cfg);
+  if (!fs.existsSync(dir)) return [];
+
+  const statusSet = new Set(statuses);
+  const tasks: TaskRecord[] = [];
+  for (const file of fs.readdirSync(dir)) {
+    if (!file.endsWith(".json")) continue;
+    const task = readJson(path.join(dir, file)) as TaskRecord | null;
+    if (task && statusSet.has(task.status)) tasks.push(task);
+  }
+  return tasks;
+}
+
+// ============================================================================
+// Task Protocol: dispatch, ACK, result
+// ============================================================================
+
+function dispatchTask(
+  cfg: ChatroomConfig,
+  to: string,
+  instruction: string,
+  logger: Logger,
+  opts?: { ackTimeoutMs?: number; taskTimeoutMs?: number; maxRetries?: number },
+): TaskRecord {
+  const channelId = `dm_${to}`;
+  const task = createTaskRecord(cfg, to, channelId, instruction, opts);
+
+  sendMessageToNAS(cfg, channelId, instruction, "TASK_DISPATCH", [to], undefined, {
+    task_id: task.task_id,
+    priority: "urgent",
+  });
+
+  logger.info(`Task ${task.task_id} dispatched to ${to} via #${channelId}`);
+  return task;
+}
+
+function sendSystemAck(cfg: ChatroomConfig, task: TaskRecord, logger: Logger): void {
+  const ackText = `[SYSTEM] Task ${task.task_id} acknowledged by ${cfg.agentId}`;
+  sendMessageToNAS(cfg, task.channel_id, ackText, "TASK_ACK", [task.from], undefined, {
+    task_id: task.task_id,
+  });
+  updateTaskRecord(cfg, task.task_id, { status: "ACKED", acked_at: nowISO() });
+  logger.info(`ACK sent for task ${task.task_id} → ${task.from}`);
+}
+
+function sendTaskResult(
+  cfg: ChatroomConfig,
+  taskId: string,
+  resultText: string,
+  status: "DONE" | "FAILED",
+  logger: Logger,
+  assetPaths: string[] = [],
+): void {
+  const task = readTaskRecord(cfg, taskId);
+  if (!task) {
+    logger.warn(`Cannot send result — task ${taskId} not found`);
+    return;
+  }
+  sendMessageToNAS(cfg, task.channel_id, resultText, "RESULT_REPORT", [task.from], undefined, {
+    task_id: taskId,
+    status,
+    asset_paths: assetPaths,
+  });
+  updateTaskRecord(cfg, taskId, {
+    status,
+    completed_at: nowISO(),
+    result_summary: resultText.slice(0, 500),
+    asset_paths: assetPaths,
+  });
+  logger.info(`Result sent for task ${taskId} (${status}) → ${task.from}`);
+}
+
+// ============================================================================
+// Daemon message handlers — route by message type
+// ============================================================================
+
+function handleIncomingTask(
+  cfg: ChatroomConfig,
+  msg: InboxMessage,
+  runtime: any,
+  config: any,
+  logger: Logger,
+): void {
+  const taskId = msg.metadata?.task_id;
+  if (!taskId) {
+    logger.warn(`TASK_DISPATCH without task_id from ${msg.from}, ignoring`);
+    return;
+  }
+
+  const task = readTaskRecord(cfg, taskId);
+  if (!task) {
+    logger.warn(`Task ${taskId} not found on NAS, creating local record`);
+    const dir = tasksDir(cfg);
+    ensureDir(dir);
+    const synthetic: TaskRecord = {
+      task_id: taskId,
+      from: msg.from,
+      to: cfg.agentId,
+      channel_id: msg.channel_id,
+      status: "DISPATCHED",
+      instruction: msg.content.text,
+      dispatched_at: msg.timestamp,
+      acked_at: null,
+      started_at: null,
+      completed_at: null,
+      result_summary: null,
+      asset_paths: [],
+      retries: 0,
+      max_retries: 3,
+      ack_timeout_ms: 30_000,
+      task_timeout_ms: 600_000,
+    };
+    writeJson(path.join(dir, `${taskId}.json`), synthetic);
+  }
+
+  const currentTask = readTaskRecord(cfg, taskId)!;
+  sendSystemAck(cfg, currentTask, logger);
+
+  updateTaskRecord(cfg, taskId, { status: "PROCESSING", started_at: nowISO() });
+  logger.info(`Processing task ${taskId} from ${msg.from}: "${msg.content.text.slice(0, 80)}..."`);
+
+  autoDispatchForTask(cfg, msg, taskId, runtime, config, logger);
+}
+
+function handleTaskAck(cfg: ChatroomConfig, msg: InboxMessage, logger: Logger): void {
+  const taskId = msg.metadata?.task_id;
+  if (!taskId) return;
+
+  const task = readTaskRecord(cfg, taskId);
+  if (!task) return;
+
+  if (task.status === "DISPATCHED" || task.status === "TIMEOUT") {
+    updateTaskRecord(cfg, taskId, { status: "ACKED", acked_at: nowISO() });
+    logger.info(`Task ${taskId} ACK received from ${msg.from}`);
+  }
+}
+
+function handleTaskResult(cfg: ChatroomConfig, msg: InboxMessage, logger: Logger): void {
+  const taskId = msg.metadata?.task_id;
+  if (!taskId) return;
+
+  const task = readTaskRecord(cfg, taskId);
+  if (!task) return;
+
+  const resultStatus = (msg.metadata?.status as TaskStatus) || "DONE";
+  updateTaskRecord(cfg, taskId, {
+    status: resultStatus,
+    completed_at: nowISO(),
+    result_summary: msg.content.text.slice(0, 500),
+    asset_paths: msg.metadata?.asset_paths ?? [],
+  });
+  logger.info(`Task ${taskId} result received from ${msg.from} (${resultStatus})`);
+}
+
+// ============================================================================
+// ACK timeout monitoring
+// ============================================================================
+
+function monitorPendingTasks(cfg: ChatroomConfig, logger: Logger): void {
+  const pending = listTasksByStatus(cfg, "DISPATCHED", "TIMEOUT");
+  const now = Date.now();
+
+  for (const task of pending) {
+    if (task.from !== cfg.agentId) continue;
+
+    const dispatchedAt = new Date(task.dispatched_at).getTime();
+    const elapsed = now - dispatchedAt;
+
+    if (elapsed > task.ack_timeout_ms) {
+      if (task.retries >= task.max_retries) {
+        updateTaskRecord(cfg, task.task_id, { status: "ABANDONED" });
+        sendMessageToNAS(
+          cfg,
+          task.channel_id,
+          `[SYSTEM] Task ${task.task_id} abandoned — ${task.to} did not respond after ${task.max_retries} retries`,
+          "SYSTEM",
+          [],
+        );
+        logger.warn(`Task ${task.task_id} ABANDONED (${task.to} unreachable)`);
+      } else {
+        updateTaskRecord(cfg, task.task_id, {
+          status: "TIMEOUT",
+          retries: task.retries + 1,
+          dispatched_at: nowISO(),
+        });
+        const root = chatroomRoot(cfg);
+        const inboxDir = path.join(root, "inbox", task.to);
+        ensureDir(inboxDir);
+        const notif = {
+          notification_id: randomUUID(),
+          timestamp: nowISO(),
+          channel_id: task.channel_id,
+          message_seq: 0,
+          from: cfg.agentId,
+          preview: `[RETRY ${task.retries + 1}/${task.max_retries}] ${task.instruction.slice(0, 80)}`,
+          priority: "urgent",
+          retry_for_task: task.task_id,
+        };
+        writeJson(
+          path.join(inboxDir, `retry_${task.task_id}_${notif.notification_id}.json`),
+          notif,
+        );
+        logger.warn(
+          `Task ${task.task_id} ACK timeout — retry ${task.retries + 1}/${task.max_retries} sent to ${task.to}`,
+        );
+      }
+    }
+  }
+
+  const processing = listTasksByStatus(cfg, "ACKED", "PROCESSING");
+  for (const task of processing) {
+    if (task.from !== cfg.agentId) continue;
+    const startedAt = new Date(task.started_at ?? task.acked_at ?? task.dispatched_at).getTime();
+    if (now - startedAt > task.task_timeout_ms) {
+      updateTaskRecord(cfg, task.task_id, { status: "FAILED", completed_at: nowISO() });
+      sendMessageToNAS(
+        cfg,
+        task.channel_id,
+        `[SYSTEM] Task ${task.task_id} timed out — ${task.to} did not deliver results within ${Math.round(task.task_timeout_ms / 60000)}min`,
+        "SYSTEM",
+        [],
+      );
+      logger.warn(`Task ${task.task_id} TIMED OUT (${task.to})`);
+    }
+  }
+}
+
+// ============================================================================
+// Orchestration context
 // ============================================================================
 
 function buildChatroomContext(cfg: ChatroomConfig): string {
@@ -289,54 +612,48 @@ function buildChatroomContext(cfg: ChatroomConfig): string {
 
   const lines: string[] = [
     `[Chatroom Orchestration Context]`,
-    `You are ${cfg.agentId}, the orchestrator of a multi-agent team.`,
-    `When a human gives you a task, you MUST break it down and dispatch sub-tasks to the appropriate agents using the chatroom_send_message tool.`,
-    `Do NOT just reply in text — actually call the tool to send messages.`,
+    `You are "${cfg.agentId}". Your role depends on context:`,
     ``,
-    `Available agents:`,
   ];
 
-  for (const a of otherAgents) {
-    const dmChannel = `dm_${a.agent_id}`;
-    const hasDM = channels.some((ch) => ch.channel_id === dmChannel);
-    const statusIcon =
-      a.status === "idle"
-        ? "🟢"
-        : a.status === "working"
-          ? "🔵"
-          : a.status === "offline"
-            ? "🔴"
-            : "🟡";
-    lines.push(
-      `  ${statusIcon} ${a.agent_id} (${a.display_name}) — ${hasDM ? `DM: ${dmChannel}` : "no DM channel"}`,
-    );
+  if (otherAgents.length > 0) {
+    lines.push(`Available agents:`);
+    for (const a of otherAgents) {
+      const dmChannel = `dm_${a.agent_id}`;
+      const hasDM = channels.some((ch) => ch.channel_id === dmChannel);
+      lines.push(
+        `  - ${a.agent_id} (${a.display_name}) [${a.status}]${hasDM ? ` — DM: ${dmChannel}` : ""}`,
+      );
+    }
+    lines.push(``);
   }
 
+  lines.push(`Task dispatch protocol:`);
+  lines.push(`  When you need another agent to perform work, use the chatroom_dispatch_task tool.`);
+  lines.push(`  This sends a formal TASK_DISPATCH with guaranteed delivery + ACK handshake.`);
+  lines.push(`  The target agent will auto-ACK and begin processing immediately.`);
   lines.push(``);
-  lines.push(`Channels you belong to:`);
-  for (const ch of channels) {
-    lines.push(`  #${ch.channel_id} (${ch.type}) — members: ${ch.members?.join(", ")}`);
-  }
+  lines.push(`  chatroom_dispatch_task(target="art", instruction="draw a steel dinosaur")`);
+  lines.push(``);
+  lines.push(`  For general chat, use chatroom_send_message instead.`);
+  lines.push(``);
 
-  lines.push(``);
-  lines.push(`How to orchestrate:`);
-  lines.push(
-    `  1. To assign a task to an agent: call chatroom_send_message with channel_id set to their DM channel (e.g. "dm_art") and mentions set to ["art"]. Write your task instructions in the text field.`,
-  );
-  lines.push(
-    `  2. To broadcast to all agents: call chatroom_send_message with channel_id="general" and mention the relevant agents.`,
-  );
-  lines.push(`  3. After dispatching, reply to the human confirming what you've done.`);
-  lines.push(
-    `  4. When agents report results (RESULT_REPORT messages), summarize and relay to the human.`,
-  );
-  lines.push(``);
+  const activeTasks = listTasksByStatus(cfg, "DISPATCHED", "ACKED", "PROCESSING");
+  if (activeTasks.length > 0) {
+    lines.push(`Active tasks:`);
+    for (const t of activeTasks) {
+      lines.push(
+        `  - [${t.status}] ${t.task_id.slice(0, 8)}... → ${t.to}: "${t.instruction.slice(0, 60)}"`,
+      );
+    }
+    lines.push(``);
+  }
 
   return lines.join("\n");
 }
 
 // ============================================================================
-// Auto-dispatch: push inbox messages through the LLM pipeline
+// Auto-dispatch: push messages through the LLM pipeline
 // ============================================================================
 
 async function autoDispatchMessage(
@@ -344,11 +661,7 @@ async function autoDispatchMessage(
   msg: InboxMessage,
   runtime: any,
   config: any,
-  logger: {
-    info: (...a: any[]) => void;
-    warn: (...a: any[]) => void;
-    error: (...a: any[]) => void;
-  },
+  logger: Logger,
 ): Promise<void> {
   const channelId = msg.channel_id;
   const isDM = channelId.startsWith("dm_");
@@ -356,10 +669,7 @@ async function autoDispatchMessage(
   const route = runtime.channel.routing.resolveAgentRoute({
     cfg: config,
     channel: "chatroom",
-    peer: {
-      kind: isDM ? "direct" : "group",
-      id: channelId,
-    },
+    peer: { kind: isDM ? "direct" : "group", id: channelId },
   });
 
   const senderLabel = msg.from.startsWith("human:")
@@ -403,9 +713,7 @@ async function autoDispatchMessage(
       try {
         const inlineMentions = parseAtMentions(text);
         const result = sendMessageToNAS(chatroomCfg, channelId, text, "CHAT", inlineMentions);
-        logger.info(
-          `Auto-reply sent to ${channelId} (seq: ${result.seq}, mentions: [${inlineMentions.join(",")}])`,
-        );
+        logger.info(`Auto-reply → #${channelId} (seq: ${result.seq})`);
       } catch (err) {
         logger.error(`Failed to send auto-reply to ${channelId}: ${err}`);
       }
@@ -415,17 +723,98 @@ async function autoDispatchMessage(
     },
   };
 
-  logger.info(
-    `Dispatching message from ${msg.from} in ${channelId} to LLM (session=${route.sessionKey})`,
-  );
+  logger.info(`Dispatching chat from ${msg.from} in #${channelId} to LLM`);
 
   await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
     ctx: ctxPayload,
     cfg: config,
     dispatcherOptions,
-    replyOptions: {
-      onModelSelected: prefixContext.onModelSelected,
+    replyOptions: { onModelSelected: prefixContext.onModelSelected },
+  });
+}
+
+/**
+ * Dispatch a TASK to the LLM. The deliver callback writes a RESULT_REPORT
+ * (not a plain CHAT) so the orchestrator's task tracker picks it up.
+ */
+async function autoDispatchForTask(
+  chatroomCfg: ChatroomConfig,
+  msg: InboxMessage,
+  taskId: string,
+  runtime: any,
+  config: any,
+  logger: Logger,
+): Promise<void> {
+  const channelId = msg.channel_id;
+  const isDM = channelId.startsWith("dm_");
+
+  const route = runtime.channel.routing.resolveAgentRoute({
+    cfg: config,
+    channel: "chatroom",
+    peer: { kind: isDM ? "direct" : "group", id: channelId },
+  });
+
+  const taskContext = [
+    `[Task Assignment]`,
+    `You have been assigned task ${taskId} by ${msg.from}.`,
+    `Instruction: ${msg.content.text}`,
+    ``,
+    `Complete the task and provide your result. Your response will be sent back as the task result.`,
+  ].join("\n");
+
+  const ctxPayload = runtime.channel.reply.finalizeInboundContext({
+    Body: taskContext,
+    BodyForAgent: taskContext,
+    RawBody: msg.content.text,
+    CommandBody: msg.content.text,
+    From: `chatroom:${msg.from}`,
+    To: `chatroom:${chatroomCfg.agentId}`,
+    SessionKey: route.sessionKey,
+    AccountId: route.accountId,
+    ChatType: isDM ? "direct" : "group",
+    SenderName: msg.from,
+    SenderId: msg.from,
+    Provider: "chatroom",
+    Surface: "chatroom",
+    MessageSid: msg.message_id,
+    Timestamp: Date.now(),
+    CommandAuthorized: true,
+  });
+
+  const prefixContext = createReplyPrefixContext({
+    cfg: config,
+    agentId: route.agentId,
+  });
+
+  const dispatcherOptions = {
+    responsePrefix: prefixContext.responsePrefix,
+    responsePrefixContextProvider: prefixContext.responsePrefixContextProvider,
+    deliver: async (payload: ReplyPayload) => {
+      const text = payload.text ?? "";
+      if (!text.trim()) return;
+      try {
+        sendTaskResult(chatroomCfg, taskId, text, "DONE", logger);
+      } catch (err) {
+        logger.error(`Failed to send task result for ${taskId}: ${err}`);
+      }
     },
+    onError: (err: any, info: any) => {
+      logger.error(`Task dispatch error for ${taskId} (${info?.kind}): ${err}`);
+      try {
+        sendTaskResult(chatroomCfg, taskId, `Task processing failed: ${err}`, "FAILED", logger);
+      } catch {
+        /* ignore */
+      }
+    },
+  };
+
+  logger.info(`Dispatching task ${taskId} to LLM`);
+
+  await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+    ctx: ctxPayload,
+    cfg: config,
+    dispatcherOptions,
+    replyOptions: { onModelSelected: prefixContext.onModelSelected },
   });
 }
 
@@ -436,7 +825,7 @@ async function autoDispatchMessage(
 const agentChatroomPlugin = {
   id: "agent-chatroom",
   name: "Agent Chatroom",
-  description: "Multi-agent collaboration chatroom over shared NAS",
+  description: "Multi-agent collaboration chatroom over shared NAS with reliable task dispatch",
 
   register(api: FirstClawPluginApi) {
     const pluginCfg = (api.pluginConfig ?? {}) as Record<string, any>;
@@ -455,133 +844,164 @@ const agentChatroomPlugin = {
       agentId,
       localDir: (pluginCfg.localDir as string) ?? "./chatroom_local",
     };
-
     ensureDir(cfg.localDir);
+    ensureDir(tasksDir(cfg));
 
     const runtime = api.runtime;
     const config = api.config;
-    const logger = {
+    const logger: Logger = {
       info: (...args: any[]) => api.logger.info(`[chatroom] ${args.join(" ")}`),
       warn: (...args: any[]) => api.logger.warn(`[chatroom] ${args.join(" ")}`),
       error: (...args: any[]) => api.logger.error(`[chatroom] ${args.join(" ")}`),
     };
 
-    // -- Tool: check inbox --------------------------------------------------
+    // ── Tool: dispatch task (handshake protocol) ────────────────────────────
 
     api.registerTool(
       {
-        name: "chatroom_check_inbox",
-        label: "Chatroom: Check Inbox",
+        name: "chatroom_dispatch_task",
+        label: "Chatroom: Dispatch Task",
         description:
-          "Check for new messages in the agent chatroom. Returns a list of messages " +
-          "from the orchestrator (FirstClaw) or broadcast channels. " +
-          "NOTE: Incoming messages are also auto-dispatched, so you usually " +
-          "do not need to call this manually.",
-        parameters: Type.Object({}),
-        async execute(_toolCallId, _params) {
+          "Dispatch a task to another agent with guaranteed delivery via the handshake protocol.\n" +
+          "The target agent will:\n" +
+          "  1. Instantly ACK (system-level, no delay)\n" +
+          "  2. Process the instruction via its LLM\n" +
+          "  3. Return a RESULT_REPORT\n" +
+          "If no ACK is received within timeout, the system retries automatically.\n\n" +
+          "Use this instead of chatroom_send_message when you need an agent to do work.",
+        parameters: Type.Object({
+          target: Type.String({
+            description: "Target agent ID (e.g. 'art', 'audio', 'gamedev', 'uiux')",
+          }),
+          instruction: Type.String({
+            description: "What you want the agent to do — be specific and actionable",
+          }),
+        }),
+        async execute(_toolCallId, params) {
           try {
-            const nasMessages = pollInbox(cfg);
-            updateHeartbeat(cfg);
-
-            if (nasMessages.length === 0) {
-              return {
-                content: [{ type: "text" as const, text: "No new messages." }],
-                details: undefined,
-              };
-            }
-
-            const all = nasMessages.map((m) => ({
-              channel: m.channel_id,
-              from: m.from,
-              type: m.type,
-              text: m.content?.text ?? "",
-              mentions: m.content?.mentions ?? [],
-              timestamp: m.timestamp,
-              message_id: m.message_id,
-            }));
-
+            const p = params as { target: string; instruction: string };
+            const task = dispatchTask(cfg, p.target, p.instruction, logger);
             return {
               content: [
                 {
                   type: "text" as const,
-                  text: `${all.length} new message(s):\n${JSON.stringify(all, null, 2)}`,
+                  text:
+                    `Task dispatched to ${p.target}.\n` +
+                    `  task_id: ${task.task_id}\n` +
+                    `  channel: #${task.channel_id}\n` +
+                    `  status: DISPATCHED (awaiting ACK)\n` +
+                    `The system will auto-retry if ${p.target} doesn't respond.`,
                 },
               ],
-              details: all,
+              details: task,
             };
           } catch (err) {
             return {
-              content: [{ type: "text" as const, text: `Error checking inbox: ${err}` }],
+              content: [{ type: "text" as const, text: `Error dispatching task: ${err}` }],
               details: undefined,
             };
           }
         },
       },
-      { names: ["chatroom_check_inbox"] },
+      { names: ["chatroom_dispatch_task"] },
     );
 
-    // -- Tool: send message -------------------------------------------------
+    // ── Tool: check task status ─────────────────────────────────────────────
+
+    api.registerTool(
+      {
+        name: "chatroom_task_status",
+        label: "Chatroom: Task Status",
+        description:
+          "Check the status of dispatched tasks. Shows active, completed, and failed tasks.",
+        parameters: Type.Object({
+          task_id: Type.Optional(
+            Type.String({ description: "Specific task ID to check, or omit for all active tasks" }),
+          ),
+        }),
+        async execute(_toolCallId, params) {
+          try {
+            const p = params as { task_id?: string };
+            if (p.task_id) {
+              const task = readTaskRecord(cfg, p.task_id);
+              if (!task)
+                return {
+                  content: [{ type: "text" as const, text: `Task ${p.task_id} not found` }],
+                  details: undefined,
+                };
+              return {
+                content: [{ type: "text" as const, text: JSON.stringify(task, null, 2) }],
+                details: task,
+              };
+            }
+            const active = listTasksByStatus(cfg, "DISPATCHED", "ACKED", "PROCESSING", "TIMEOUT");
+            if (active.length === 0)
+              return {
+                content: [{ type: "text" as const, text: "No active tasks." }],
+                details: undefined,
+              };
+            const summary = active.map((t) => ({
+              task_id: t.task_id,
+              to: t.to,
+              status: t.status,
+              instruction: t.instruction.slice(0, 80),
+              dispatched_at: t.dispatched_at,
+              retries: t.retries,
+            }));
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `${active.length} active task(s):\n${JSON.stringify(summary, null, 2)}`,
+                },
+              ],
+              details: summary,
+            };
+          } catch (err) {
+            return {
+              content: [{ type: "text" as const, text: `Error: ${err}` }],
+              details: undefined,
+            };
+          }
+        },
+      },
+      { names: ["chatroom_task_status"] },
+    );
+
+    // ── Tool: send message (general chat, non-task) ─────────────────────────
 
     api.registerTool(
       {
         name: "chatroom_send_message",
         label: "Chatroom: Send Message",
         description:
-          "Send a message to a chatroom channel. This is your PRIMARY tool for orchestration.\n\n" +
-          "To dispatch a task to an agent, send to their DM channel with a mention:\n" +
-          "  - channel_id: 'dm_art', mentions: ['art']   → assigns work to the art agent\n" +
-          "  - channel_id: 'dm_audio', mentions: ['audio'] → assigns work to the audio agent\n" +
-          "  - channel_id: 'dm_gamedev', mentions: ['gamedev'] → assigns work to the gamedev agent\n" +
-          "  - channel_id: 'dm_uiux', mentions: ['uiux']  → assigns work to the UIUX agent\n" +
-          "  - channel_id: 'general', mentions: ['art','audio'] → broadcast to specific agents\n\n" +
-          "Mentioned agents receive high-priority inbox notifications and will respond automatically.",
+          "Send a general chat message to a channel. For task assignments, use chatroom_dispatch_task instead.\n" +
+          "Use this for: status updates, questions, broadcasting information, chatting.",
         parameters: Type.Object({
           channel_id: Type.String({
-            description:
-              "Target channel ID. Use DM channels (dm_art, dm_audio, dm_gamedev, dm_uiux) for private task dispatch, or 'general'/'pipeline' for broadcasts.",
+            description: "Target channel ID (e.g. 'general', 'pipeline', 'dm_art')",
           }),
-          text: Type.String({
-            description: "Message content — task instructions, questions, or status updates",
-          }),
+          text: Type.String({ description: "Message content" }),
           mentions: Type.Optional(
-            Type.Array(Type.String(), {
-              description:
-                "Agent IDs to mention — they will receive high-priority notifications (e.g. ['art'], ['gamedev', 'uiux'])",
-            }),
-          ),
-          type: Type.Optional(
-            Type.String({
-              description: "Message type: CHAT (default), TASK_DISPATCH, STATUS_UPDATE",
-            }),
+            Type.Array(Type.String(), { description: "Agent IDs to @mention" }),
           ),
         }),
         async execute(_toolCallId, params) {
           try {
-            const p = params as {
-              channel_id: string;
-              text: string;
-              mentions?: string[];
-              type?: string;
-            };
-            const result = sendMessageToNAS(
-              cfg,
-              p.channel_id,
-              p.text,
-              p.type ?? "CHAT",
-              p.mentions ?? [],
-            );
+            const p = params as { channel_id: string; text: string; mentions?: string[] };
+            const result = sendMessageToNAS(cfg, p.channel_id, p.text, "CHAT", p.mentions ?? []);
             return {
               content: [
                 {
                   type: "text" as const,
-                  text: `Message sent to #${p.channel_id} (seq: ${result.seq}${p.mentions?.length ? `, mentioned: ${p.mentions.join(",")}` : ""})`,
+                  text: `Message sent to #${p.channel_id} (seq: ${result.seq})`,
                 },
               ],
               details: result,
             };
           } catch (err) {
             return {
-              content: [{ type: "text" as const, text: `Error sending message: ${err}` }],
+              content: [{ type: "text" as const, text: `Error: ${err}` }],
               details: undefined,
             };
           }
@@ -590,13 +1010,13 @@ const agentChatroomPlugin = {
       { names: ["chatroom_send_message"] },
     );
 
-    // -- Tool: list channels ------------------------------------------------
+    // ── Tool: list channels ─────────────────────────────────────────────────
 
     api.registerTool(
       {
         name: "chatroom_list_channels",
         label: "Chatroom: List Channels",
-        description: "List all chatroom channels this agent belongs to, including members.",
+        description: "List all chatroom channels this agent belongs to.",
         parameters: Type.Object({}),
         async execute(_toolCallId, _params) {
           try {
@@ -614,7 +1034,7 @@ const agentChatroomPlugin = {
             return { content: [{ type: "text" as const, text }], details: undefined };
           } catch (err) {
             return {
-              content: [{ type: "text" as const, text: `Error listing channels: ${err}` }],
+              content: [{ type: "text" as const, text: `Error: ${err}` }],
               details: undefined,
             };
           }
@@ -623,84 +1043,63 @@ const agentChatroomPlugin = {
       { names: ["chatroom_list_channels"] },
     );
 
-    // -- Tool: report task result -------------------------------------------
+    // ── Tool: check inbox (manual, usually not needed) ──────────────────────
 
     api.registerTool(
       {
-        name: "chatroom_report_result",
-        label: "Chatroom: Report Task Result",
+        name: "chatroom_check_inbox",
+        label: "Chatroom: Check Inbox",
         description:
-          "Report the completion (or failure) of a task back to the orchestrator (FirstClaw). " +
-          "Use this when you finish a task that was assigned to you.",
-        parameters: Type.Object({
-          channel_id: Type.String({
-            description: "Channel to report in (usually your DM channel, e.g. 'dm_art')",
-          }),
-          text: Type.String({ description: "Summary of what was accomplished" }),
-          task_id: Type.String({ description: "The task ID being reported on" }),
-          status: Type.Optional(
-            Type.String({
-              description: "Task status: DONE or FAILED (default: DONE)",
-            }),
-          ),
-          asset_paths: Type.Optional(
-            Type.Array(Type.String(), {
-              description: "Paths to produced assets/files",
-            }),
-          ),
-        }),
-        async execute(_toolCallId, params) {
+          "Manually check inbox. Usually not needed — the daemon auto-dispatches messages.",
+        parameters: Type.Object({}),
+        async execute(_toolCallId, _params) {
           try {
-            const p = params as {
-              channel_id: string;
-              text: string;
-              task_id: string;
-              status?: string;
-              asset_paths?: string[];
-            };
-            const result = sendMessageToNAS(
-              cfg,
-              p.channel_id,
-              p.text,
-              "RESULT_REPORT",
-              ["firstclaw"],
-              undefined,
-              {
-                task_id: p.task_id,
-                status: p.status ?? "DONE",
-                asset_paths: p.asset_paths ?? [],
-              },
-            );
+            const msgs = pollInbox(cfg);
+            updateHeartbeat(cfg);
+            if (msgs.length === 0)
+              return {
+                content: [{ type: "text" as const, text: "No new messages." }],
+                details: undefined,
+              };
+            const all = msgs.map((m) => ({
+              channel: m.channel_id,
+              from: m.from,
+              type: m.type,
+              text: m.content?.text ?? "",
+              message_id: m.message_id,
+            }));
             return {
               content: [
                 {
                   type: "text" as const,
-                  text: `Result reported for task ${p.task_id} (status: ${p.status ?? "DONE"}, seq: ${result.seq})`,
+                  text: `${all.length} message(s):\n${JSON.stringify(all, null, 2)}`,
                 },
               ],
-              details: result,
+              details: all,
             };
           } catch (err) {
             return {
-              content: [{ type: "text" as const, text: `Error reporting result: ${err}` }],
+              content: [{ type: "text" as const, text: `Error: ${err}` }],
               details: undefined,
             };
           }
         },
       },
-      { names: ["chatroom_report_result"] },
+      { names: ["chatroom_check_inbox"] },
     );
 
-    // -- Background service: heartbeat + auto-dispatch polling ---------------
+    // ── Background service ──────────────────────────────────────────────────
 
     const pollIntervalMs = (pluginCfg.pollIntervalMs as number) ?? 3000;
+    const taskMonitorIntervalMs = (pluginCfg.taskMonitorIntervalMs as number) ?? 10_000;
     let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
     let pollTimer: ReturnType<typeof setInterval> | null = null;
+    let taskMonitorTimer: ReturnType<typeof setInterval> | null = null;
 
     api.registerService({
       id: "chatroom-daemon",
       start: async () => {
-        logger.info(`Chatroom daemon started for agent=${agentId} (auto-dispatch enabled)`);
+        logger.info(`Chatroom daemon started for agent=${agentId} (task protocol enabled)`);
         updateHeartbeat(cfg);
 
         heartbeatTimer = setInterval(() => {
@@ -711,24 +1110,50 @@ const agentChatroomPlugin = {
           }
         }, 30_000);
 
+        // Main inbox poll — routes messages by type
         pollTimer = setInterval(async () => {
           try {
             const messages = pollInbox(cfg);
             for (const msg of messages) {
               try {
-                await autoDispatchMessage(cfg, msg, runtime, config, logger);
+                switch (msg.type) {
+                  case "TASK_DISPATCH":
+                    handleIncomingTask(cfg, msg, runtime, config, logger);
+                    break;
+                  case "TASK_ACK":
+                    handleTaskAck(cfg, msg, logger);
+                    break;
+                  case "RESULT_REPORT":
+                    handleTaskResult(cfg, msg, logger);
+                    // Also dispatch to LLM so orchestrator can relay to human
+                    await autoDispatchMessage(cfg, msg, runtime, config, logger);
+                    break;
+                  default:
+                    await autoDispatchMessage(cfg, msg, runtime, config, logger);
+                    break;
+                }
               } catch (err) {
-                logger.error(`Auto-dispatch failed for ${msg.message_id}: ${err}`);
+                logger.error(`Message handling failed for ${msg.message_id}: ${err}`);
               }
             }
           } catch {
             /* ignore */
           }
         }, pollIntervalMs);
+
+        // Task timeout / retry monitor
+        taskMonitorTimer = setInterval(() => {
+          try {
+            monitorPendingTasks(cfg, logger);
+          } catch {
+            /* ignore */
+          }
+        }, taskMonitorIntervalMs);
       },
       stop: async () => {
         if (heartbeatTimer) clearInterval(heartbeatTimer);
         if (pollTimer) clearInterval(pollTimer);
+        if (taskMonitorTimer) clearInterval(taskMonitorTimer);
         logger.info("Chatroom daemon stopped");
       },
     });
