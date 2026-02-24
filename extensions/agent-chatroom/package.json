@@ -1,0 +1,17 @@
+{
+  "name": "@firstclaw/agent-chatroom",
+  "version": "0.1.0",
+  "description": "Multi-agent collaboration chatroom over shared NAS",
+  "type": "module",
+  "dependencies": {
+    "@sinclair/typebox": "0.34.48"
+  },
+  "devDependencies": {
+    "firstclaw": "workspace:*"
+  },
+  "firstclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
