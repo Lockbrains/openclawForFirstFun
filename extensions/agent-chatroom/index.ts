@@ -174,6 +174,24 @@ function tasksDir(cfg: ChatroomConfig): string {
   return path.join(chatroomRoot(cfg), "tasks");
 }
 
+function assetsDir(cfg: ChatroomConfig, agentId?: string): string {
+  const base = path.join(chatroomRoot(cfg), "assets");
+  return agentId ? path.join(base, agentId) : base;
+}
+
+function taskAssetsDir(cfg: ChatroomConfig, agentId: string, taskId: string): string {
+  return path.join(assetsDir(cfg, agentId), taskId);
+}
+
+function scanOutputDir(dir: string): string[] {
+  if (!fs.existsSync(dir)) return [];
+  const files: string[] = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (entry.isFile()) files.push(path.join(dir, entry.name));
+  }
+  return files;
+}
+
 function readAgentRegistry(cfg: ChatroomConfig): AgentRegistryEntry[] {
   const regDir = path.join(chatroomRoot(cfg), "registry");
   if (!fs.existsSync(regDir)) return [];
@@ -399,12 +417,16 @@ function dispatchTask(
   const channelId = `dm_${to}`;
   const task = createTaskRecord(cfg, to, channelId, instruction, opts);
 
+  const outputDir = taskAssetsDir(cfg, to, task.task_id);
+  ensureDir(outputDir);
+
   sendMessageToNAS(cfg, channelId, instruction, "TASK_DISPATCH", [to], undefined, {
     task_id: task.task_id,
     priority: "urgent",
+    output_dir: outputDir,
   });
 
-  logger.info(`Task ${task.task_id} dispatched to ${to} via #${channelId}`);
+  logger.info(`Task ${task.task_id} dispatched to ${to} via #${channelId} (output: ${outputDir})`);
   return task;
 }
 
@@ -610,9 +632,19 @@ function buildChatroomContext(cfg: ChatroomConfig): string {
   const otherAgents = agents.filter((a) => a.agent_id !== cfg.agentId);
   if (otherAgents.length === 0 && channels.length === 0) return "";
 
+  const myAssets = assetsDir(cfg, cfg.agentId);
+  const sharedAssets = assetsDir(cfg, "shared");
+
   const lines: string[] = [
     `[Chatroom Orchestration Context]`,
     `You are "${cfg.agentId}". Your role depends on context:`,
+    ``,
+    `File system (NAS):`,
+    `  Your output dir: ${myAssets}`,
+    `  Shared dir: ${sharedAssets}`,
+    `  All agent assets: ${assetsDir(cfg)}`,
+    `  When dispatching a task, the system auto-creates an output dir for the target.`,
+    `  The target agent receives the path in metadata.output_dir.`,
     ``,
   ];
 
@@ -632,6 +664,7 @@ function buildChatroomContext(cfg: ChatroomConfig): string {
   lines.push(`  When you need another agent to perform work, use the chatroom_dispatch_task tool.`);
   lines.push(`  This sends a formal TASK_DISPATCH with guaranteed delivery + ACK handshake.`);
   lines.push(`  The target agent will auto-ACK and begin processing immediately.`);
+  lines.push(`  Output files are placed in: ${assetsDir(cfg)}/{agent_id}/{task_id}/`);
   lines.push(``);
   lines.push(`  chatroom_dispatch_task(target="art", instruction="draw a steel dinosaur")`);
   lines.push(``);
@@ -754,12 +787,18 @@ async function autoDispatchForTask(
     peer: { kind: isDM ? "direct" : "group", id: channelId },
   });
 
+  const outputDir =
+    msg.metadata?.output_dir ?? taskAssetsDir(chatroomCfg, chatroomCfg.agentId, taskId);
+  ensureDir(outputDir as string);
+
   const taskContext = [
     `[Task Assignment]`,
     `You have been assigned task ${taskId} by ${msg.from}.`,
     `Instruction: ${msg.content.text}`,
     ``,
-    `Complete the task and provide your result. Your response will be sent back as the task result.`,
+    `File output directory: ${outputDir}`,
+    `Save any files/assets you produce to this directory on the NAS.`,
+    `When done, your text response will be sent back as the task result.`,
   ].join("\n");
 
   const ctxPayload = runtime.channel.reply.finalizeInboundContext({
@@ -793,7 +832,8 @@ async function autoDispatchForTask(
       const text = payload.text ?? "";
       if (!text.trim()) return;
       try {
-        sendTaskResult(chatroomCfg, taskId, text, "DONE", logger);
+        const producedFiles = scanOutputDir(outputDir as string);
+        sendTaskResult(chatroomCfg, taskId, text, "DONE", logger, producedFiles);
       } catch (err) {
         logger.error(`Failed to send task result for ${taskId}: ${err}`);
       }
