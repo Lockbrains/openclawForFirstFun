@@ -648,22 +648,22 @@ export async function handleFeishuMessage(params: {
     });
     ctx = { ...ctx, senderName: botName };
   } else {
-    const senderResult = await resolveFeishuSenderName({
-      account,
-      senderOpenId: ctx.senderOpenId,
-      log,
-    });
-    if (senderResult.name) ctx = { ...ctx, senderName: senderResult.name };
+  const senderResult = await resolveFeishuSenderName({
+    account,
+    senderOpenId: ctx.senderOpenId,
+    log,
+  });
+  if (senderResult.name) ctx = { ...ctx, senderName: senderResult.name };
 
-    // Track permission error to inform agent later (with cooldown to avoid repetition)
-    if (senderResult.permissionError) {
-      const appKey = account.appId ?? "default";
-      const now = Date.now();
-      const lastNotified = permissionErrorNotifiedAt.get(appKey) ?? 0;
+  // Track permission error to inform agent later (with cooldown to avoid repetition)
+  if (senderResult.permissionError) {
+    const appKey = account.appId ?? "default";
+    const now = Date.now();
+    const lastNotified = permissionErrorNotifiedAt.get(appKey) ?? 0;
 
-      if (now - lastNotified > PERMISSION_ERROR_COOLDOWN_MS) {
-        permissionErrorNotifiedAt.set(appKey, now);
-        permissionErrorForAgent = senderResult.permissionError;
+    if (now - lastNotified > PERMISSION_ERROR_COOLDOWN_MS) {
+      permissionErrorNotifiedAt.set(appKey, now);
+      permissionErrorForAgent = senderResult.permissionError;
       }
     }
   }
@@ -748,23 +748,23 @@ export async function handleFeishuMessage(params: {
       });
 
       if (!textMentioned) {
-        log(
-          `feishu[${account.accountId}]: message in group ${ctx.chatId} did not mention bot, recording to history`,
-        );
-        if (chatHistories) {
-          recordPendingHistoryEntryIfEnabled({
-            historyMap: chatHistories,
-            historyKey: ctx.chatId,
-            limit: historyLimit,
-            entry: {
-              sender: ctx.senderOpenId,
-              body: `${ctx.senderName ?? ctx.senderOpenId}: ${ctx.content}`,
-              timestamp: Date.now(),
-              messageId: ctx.messageId,
-            },
-          });
-        }
-        return;
+      log(
+        `feishu[${account.accountId}]: message in group ${ctx.chatId} did not mention bot, recording to history`,
+      );
+      if (chatHistories) {
+        recordPendingHistoryEntryIfEnabled({
+          historyMap: chatHistories,
+          historyKey: ctx.chatId,
+          limit: historyLimit,
+          entry: {
+            sender: ctx.senderOpenId,
+            body: `${ctx.senderName ?? ctx.senderOpenId}: ${ctx.content}`,
+            timestamp: Date.now(),
+            messageId: ctx.messageId,
+          },
+        });
+      }
+      return;
       }
       log(
         `feishu[${account.accountId}]: text-based @mention detected for agent ${earlyRoute.agentId} in group ${ctx.chatId}`,

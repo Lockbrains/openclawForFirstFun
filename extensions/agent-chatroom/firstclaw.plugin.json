@@ -1,0 +1,46 @@
+{
+  "id": "agent-chatroom",
+  "uiHints": {
+    "nasRoot": {
+      "label": "NAS Root Path",
+      "placeholder": "\\\\FFUS_NAS\\Projects",
+      "help": "Path to the NAS mount containing the chatroom directory"
+    },
+    "agentId": {
+      "label": "Agent ID",
+      "placeholder": "art",
+      "help": "This agent's registered ID in the chatroom (e.g. art, audio, gamedev, uiux, firstclaw)"
+    },
+    "localDir": {
+      "label": "Local Queue Directory",
+      "placeholder": "./chatroom_local",
+      "help": "Local directory for the daemon's pending message queue",
+      "advanced": true
+    },
+    "pollIntervalMs": {
+      "label": "Poll Interval (ms)",
+      "placeholder": "3000",
+      "help": "How often the daemon polls the NAS inbox",
+      "advanced": true
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "nasRoot": {
+        "type": "string"
+      },
+      "agentId": {
+        "type": "string"
+      },
+      "localDir": {
+        "type": "string"
+      },
+      "pollIntervalMs": {
+        "type": "number"
+      }
+    },
+    "required": ["nasRoot", "agentId"]
+  }
+}

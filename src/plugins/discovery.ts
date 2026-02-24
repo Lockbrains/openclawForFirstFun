@@ -25,6 +25,7 @@ const ALLOWED_EXTENSIONS = new Set([
   "diagnostics-otel",
   "llm-task",
   "lobster",
+  "agent-chatroom",
 ]);
 
 export type PluginCandidate = {
