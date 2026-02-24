@@ -184,11 +184,15 @@ function taskAssetsDir(cfg: ChatroomConfig, agentId: string, taskId: string): st
   return path.join(assetsDir(cfg, agentId), taskId);
 }
 
+function toForwardSlash(p: string): string {
+  return p.replace(/\\/g, "/");
+}
+
 function scanOutputDir(dir: string): string[] {
   if (!fs.existsSync(dir)) return [];
   const files: string[] = [];
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (entry.isFile()) files.push(path.join(dir, entry.name));
+    if (entry.isFile()) files.push(toForwardSlash(path.join(dir, entry.name)));
   }
   return files;
 }
@@ -1195,7 +1199,7 @@ const agentChatroomPlugin = {
               ? taskAssetsDir(cfg, cfg.agentId, p.task_id)
               : assetsDir(cfg, cfg.agentId);
             ensureDir(dir);
-            const filePath = path.join(dir, p.filename);
+            const filePath = toForwardSlash(path.join(dir, p.filename));
 
             if (p.encoding === "base64") {
               fs.writeFileSync(filePath, Buffer.from(p.content, "base64"));
@@ -1341,7 +1345,7 @@ const agentChatroomPlugin = {
               ? taskAssetsDir(cfg, cfg.agentId, p.task_id)
               : assetsDir(cfg, cfg.agentId);
             ensureDir(dir);
-            const filePath = path.join(dir, p.filename);
+            const filePath = toForwardSlash(path.join(dir, p.filename));
 
             if (p.encoding === "base64") {
               fs.writeFileSync(filePath, Buffer.from(p.content, "base64"));
