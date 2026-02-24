@@ -64,10 +64,15 @@ function resolveNasRoot(cliOverride?: string): string | null {
   return (chatroomConfig?.nasRoot as string) ?? null;
 }
 
-function updateLocalConfig(agentId: string): void {
+function updateLocalConfig(agentId: string, nasRoot?: string): void {
   const configPath = resolveCanonicalConfigPath();
-  const raw = fs.readFileSync(configPath, "utf-8");
-  const cfg = JSON.parse(raw);
+  let cfg: Record<string, any> = {};
+  try {
+    cfg = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+  } catch {
+    // Config doesn't exist yet — create from scratch
+    fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  }
 
   if (!cfg.plugins) {
     cfg.plugins = {};
@@ -83,10 +88,10 @@ function updateLocalConfig(agentId: string): void {
   }
 
   cfg.plugins.entries["agent-chatroom"].config.agentId = agentId;
-
-  if (!cfg.plugins.entries["agent-chatroom"].enabled) {
-    cfg.plugins.entries["agent-chatroom"].enabled = true;
+  if (nasRoot) {
+    cfg.plugins.entries["agent-chatroom"].config.nasRoot = nasRoot;
   }
+  cfg.plugins.entries["agent-chatroom"].enabled = true;
 
   writeJsonFile(configPath, cfg);
 }
@@ -94,6 +99,7 @@ function updateLocalConfig(agentId: string): void {
 interface RegisterOptions {
   id?: string;
   nasRoot?: string;
+  force?: boolean;
 }
 
 function runRegister(category: string, displayName: string, opts: RegisterOptions): void {
@@ -119,6 +125,12 @@ function runRegister(category: string, displayName: string, opts: RegisterOption
       "Error: Cannot determine NAS root. Either pass --nas-root or configure it in firstclaw.json " +
         '(plugins.entries["agent-chatroom"].config.nasRoot)',
     );
+    console.error(
+      `\nExample: firstclaw register ${category} "${displayName}" --nas-root /Volumes/Projects`,
+    );
+    console.error(
+      `         firstclaw register ${category} "${displayName}" --nas-root "\\\\FFUS_NAS\\Projects"`,
+    );
     process.exit(1);
   }
 
@@ -131,9 +143,13 @@ function runRegister(category: string, displayName: string, opts: RegisterOption
   // Check for duplicate
   const registryDir = path.join(chatroomRoot, "registry");
   const registryPath = path.join(registryDir, `${agentId}.json`);
-  if (fs.existsSync(registryPath)) {
+  if (fs.existsSync(registryPath) && !opts.force) {
     console.error(`Error: Agent "${agentId}" already registered at ${registryPath}`);
+    console.error(`Use --force to re-register and repair.`);
     process.exit(1);
+  }
+  if (opts.force && fs.existsSync(registryPath)) {
+    console.log(`  [~] Force mode: overwriting existing registration for "${agentId}"`);
   }
 
   console.log(`Registering agent: ${displayName} (id: ${agentId}, category: ${category})`);
@@ -169,6 +185,11 @@ function runRegister(category: string, displayName: string, opts: RegisterOption
     last_message_seq: 0,
   };
   writeJsonFile(path.join(dmDir, "meta.json"), dmMeta);
+  const archivedMarker = path.join(dmDir, ".archived");
+  if (fs.existsSync(archivedMarker)) {
+    fs.unlinkSync(archivedMarker);
+    console.log(`  [~] Removed .archived marker from ${dmChannelId}`);
+  }
   console.log(`  [+] DM channel: ${dmChannelId}`);
 
   // 3. Update channel index
@@ -215,8 +236,8 @@ function runRegister(category: string, displayName: string, opts: RegisterOption
 
   // 5. Update local firstclaw.json
   try {
-    updateLocalConfig(agentId);
-    console.log(`  [+] Local config: agentId set to "${agentId}"`);
+    updateLocalConfig(agentId, nasRoot);
+    console.log(`  [+] Local config: agentId="${agentId}", nasRoot="${nasRoot}"`);
   } catch (err) {
     console.warn(`  [!] Could not update local config: ${err}`);
   }
@@ -236,6 +257,7 @@ export function registerRegisterCli(program: Command) {
     .argument("<displayName>", 'Display name (e.g. "FirstArt02")')
     .option("--id <agentId>", "Override auto-derived agent_id")
     .option("--nas-root <path>", "NAS root path (default: from config)")
+    .option("--force", "Re-register even if agent already exists (repairs partial registrations)")
     .action((category: string, displayName: string, opts: RegisterOptions) => {
       runRegister(category, displayName, opts);
     });
