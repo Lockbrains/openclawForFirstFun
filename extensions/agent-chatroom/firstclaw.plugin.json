@@ -11,6 +11,11 @@
       "placeholder": "art",
       "help": "This agent's registered ID in the chatroom (e.g. art, audio, gamedev, uiux, firstclaw)"
     },
+    "role": {
+      "label": "Agent Role",
+      "placeholder": "worker",
+      "help": "Set to 'orchestrator' for FirstClaw only. All other agents must be 'worker'. Workers can only receive tasks via DM and cannot interact in #general."
+    },
     "localDir": {
       "label": "Local Queue Directory",
       "placeholder": "./chatroom_local",
@@ -33,6 +38,11 @@
       },
       "agentId": {
         "type": "string"
+      },
+      "role": {
+        "type": "string",
+        "enum": ["orchestrator", "worker"],
+        "default": "worker"
       },
       "localDir": {
         "type": "string"

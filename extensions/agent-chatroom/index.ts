@@ -33,6 +33,7 @@ interface ChatroomConfig {
   nasRoot: string;
   agentId: string;
   localDir: string;
+  role: "orchestrator" | "worker";
 }
 
 interface AgentRegistryEntry {
@@ -675,7 +676,7 @@ function monitorPendingTasks(cfg: ChatroomConfig, logger: Logger): void {
 // Orchestration context
 // ============================================================================
 
-function buildChatroomContext(cfg: ChatroomConfig, sourceChannel?: string): string {
+function buildOrchestratorContext(cfg: ChatroomConfig, sourceChannel?: string): string {
   const agents = readAgentRegistry(cfg);
   const channels = listAgentChannels(cfg);
 
@@ -751,6 +752,42 @@ function buildChatroomContext(cfg: ChatroomConfig, sourceChannel?: string): stri
   return lines.join("\n");
 }
 
+function buildWorkerContext(cfg: ChatroomConfig, sourceChannel?: string): string {
+  const myAssets = assetsDir(cfg, cfg.agentId);
+  const myDM = `dm_${cfg.agentId}`;
+
+  const lines: string[] = [
+    `[Agent Worker Context]`,
+    `You are "${cfg.agentId}", a specialist worker agent in the First Agent Family.`,
+    ``,
+    `═══ YOUR ROLE ═══`,
+    `  You are NOT the orchestrator. You are a task executor.`,
+    `  You receive tasks via your DM channel (#${myDM}) from the orchestrator.`,
+    `  You complete tasks and report results — that's it.`,
+    ``,
+    `═══ STRICT RULES ═══`,
+    `  1. NEVER respond to human messages. You are not the orchestrator.`,
+    `  2. NEVER send messages to #general. That channel is orchestrator-only.`,
+    `  3. NEVER dispatch tasks to other agents. Only the orchestrator does that.`,
+    `  4. ONLY communicate in your DM channel: #${myDM}.`,
+    `  5. Focus entirely on completing the assigned task.`,
+    ``,
+    `═══ File System (NAS) ═══`,
+    `  Your output dir: ${myAssets}`,
+    sourceChannel ? `  Current channel: #${sourceChannel}` : ``,
+    ``,
+  ];
+
+  return lines.join("\n");
+}
+
+function buildChatroomContext(cfg: ChatroomConfig, sourceChannel?: string): string {
+  if (cfg.role === "orchestrator") {
+    return buildOrchestratorContext(cfg, sourceChannel);
+  }
+  return buildWorkerContext(cfg, sourceChannel);
+}
+
 // ============================================================================
 // Auto-dispatch: push messages through the LLM pipeline
 // ============================================================================
@@ -764,6 +801,17 @@ async function autoDispatchMessage(
 ): Promise<void> {
   const channelId = msg.channel_id;
   const isDM = channelId.startsWith("dm_");
+
+  // Hard gate: workers must not respond outside their DM channel
+  if (chatroomCfg.role !== "orchestrator") {
+    const myDM = `dm_${chatroomCfg.agentId}`;
+    if (channelId !== myDM) {
+      logger.info(
+        `[worker] Blocked LLM dispatch for #${channelId} — workers only respond in their DM`,
+      );
+      return;
+    }
+  }
 
   const route = runtime.channel.routing.resolveAgentRoute({
     cfg: config,
@@ -962,9 +1010,13 @@ const agentChatroomPlugin = {
       return;
     }
 
+    const rawRole = (pluginCfg.role as string) ?? "worker";
+    const role: "orchestrator" | "worker" = rawRole === "orchestrator" ? "orchestrator" : "worker";
+
     const cfg: ChatroomConfig = {
       nasRoot,
       agentId,
+      role,
       localDir: (pluginCfg.localDir as string) ?? "./chatroom_local",
     };
     ensureDir(cfg.localDir);
@@ -978,183 +1030,198 @@ const agentChatroomPlugin = {
       error: (...args: any[]) => api.logger.error(`[chatroom] ${args.join(" ")}`),
     };
 
-    // ── Tool: dispatch task (handshake protocol) ────────────────────────────
-
-    api.registerTool(
-      {
-        name: "chatroom_dispatch_task",
-        label: "Chatroom: Dispatch Task",
-        description:
-          "Dispatch a task to another agent with guaranteed delivery via the handshake protocol.\n" +
-          "The target agent will:\n" +
-          "  1. Instantly ACK (system-level, no delay)\n" +
-          "  2. Process the instruction via its LLM\n" +
-          "  3. Return a RESULT_REPORT\n" +
-          "If no ACK is received within timeout, the system retries automatically.\n\n" +
-          "Use this instead of chatroom_send_message when you need an agent to do work.",
-        parameters: Type.Object({
-          target: Type.String({
-            description: "Target agent ID (e.g. 'art', 'audio', 'gamedev', 'uiux')",
-          }),
-          instruction: Type.String({
-            description: "What you want the agent to do — be specific and actionable",
-          }),
-        }),
-        async execute(_toolCallId, params) {
-          try {
-            const p = params as { target: string; instruction: string };
-            const task = dispatchTask(cfg, p.target, p.instruction, logger);
-            return {
-              content: [
-                {
-                  type: "text" as const,
-                  text:
-                    `Task dispatched to ${p.target}.\n` +
-                    `  task_id: ${task.task_id}\n` +
-                    `  channel: #${task.channel_id}\n` +
-                    `  status: DISPATCHED (awaiting ACK)\n` +
-                    `The system will auto-retry if ${p.target} doesn't respond.`,
-                },
-              ],
-              details: task,
-            };
-          } catch (err) {
-            return {
-              content: [{ type: "text" as const, text: `Error dispatching task: ${err}` }],
-              details: undefined,
-            };
-          }
-        },
-      },
-      { names: ["chatroom_dispatch_task"] },
+    logger.info(
+      `Agent "${agentId}" initialized with role: ${role.toUpperCase()}` +
+        (role === "worker"
+          ? ` — will ONLY process messages from dm_${agentId}`
+          : ` — full orchestration enabled`),
     );
 
-    // ── Tool: check task status ─────────────────────────────────────────────
+    // ── Orchestrator-only tools ─────────────────────────────────────────────
+    // dispatch_task, cancel_task, task_status are only useful for the orchestrator.
+    // Workers receive tasks; they don't create or manage them.
 
-    api.registerTool(
-      {
-        name: "chatroom_task_status",
-        label: "Chatroom: Task Status",
-        description:
-          "Check the status of dispatched tasks. Shows active, completed, and failed tasks.",
-        parameters: Type.Object({
-          task_id: Type.Optional(
-            Type.String({ description: "Specific task ID to check, or omit for all active tasks" }),
-          ),
-        }),
-        async execute(_toolCallId, params) {
-          try {
-            const p = params as { task_id?: string };
-            if (p.task_id) {
-              const task = readTaskRecord(cfg, p.task_id);
-              if (!task)
-                return {
-                  content: [{ type: "text" as const, text: `Task ${p.task_id} not found` }],
-                  details: undefined,
-                };
-              return {
-                content: [{ type: "text" as const, text: JSON.stringify(task, null, 2) }],
-                details: task,
-              };
-            }
-            const active = listTasksByStatus(cfg, "DISPATCHED", "ACKED", "PROCESSING", "TIMEOUT");
-            if (active.length === 0)
-              return {
-                content: [{ type: "text" as const, text: "No active tasks." }],
-                details: undefined,
-              };
-            const summary = active.map((t) => ({
-              task_id: t.task_id,
-              to: t.to,
-              status: t.status,
-              instruction: t.instruction.slice(0, 80),
-              dispatched_at: t.dispatched_at,
-              retries: t.retries,
-            }));
-            return {
-              content: [
-                {
-                  type: "text" as const,
-                  text: `${active.length} active task(s):\n${JSON.stringify(summary, null, 2)}`,
-                },
-              ],
-              details: summary,
-            };
-          } catch (err) {
-            return {
-              content: [{ type: "text" as const, text: `Error: ${err}` }],
-              details: undefined,
-            };
-          }
-        },
-      },
-      { names: ["chatroom_task_status"] },
-    );
-
-    // ── Tool: cancel / terminate a task ──────────────────────────────────
-
-    api.registerTool(
-      {
-        name: "chatroom_cancel_task",
-        label: "Chatroom: Cancel Task",
-        description:
-          "Cancel an active task. Use this when:\n" +
-          "  - A task is stuck (agent cannot complete it)\n" +
-          "  - You want to reassign the work to a different agent\n" +
-          "  - The task is no longer needed\n" +
-          "Sets the task status to CANCELLED, notifies the target agent, and resets their status to idle.",
-        parameters: Type.Object({
-          task_id: Type.String({ description: "The task ID to cancel" }),
-          reason: Type.Optional(
-            Type.String({ description: "Why the task is being cancelled (shown to the agent)" }),
-          ),
-        }),
-        async execute(_toolCallId, params) {
-          try {
-            const p = params as { task_id: string; reason?: string };
-            const reason = p.reason ?? "Cancelled by orchestrator";
-            const result = cancelTask(cfg, p.task_id, reason, logger);
-            if (!result) {
-              return {
-                content: [{ type: "text" as const, text: `Task ${p.task_id} not found.` }],
-                details: undefined,
-              };
-            }
-            if (result.status !== "CANCELLED") {
+    if (role === "orchestrator") {
+      api.registerTool(
+        {
+          name: "chatroom_dispatch_task",
+          label: "Chatroom: Dispatch Task",
+          description:
+            "Dispatch a task to another agent with guaranteed delivery via the handshake protocol.\n" +
+            "The target agent will:\n" +
+            "  1. Instantly ACK (system-level, no delay)\n" +
+            "  2. Process the instruction via its LLM\n" +
+            "  3. Return a RESULT_REPORT\n" +
+            "If no ACK is received within timeout, the system retries automatically.\n\n" +
+            "Use this instead of chatroom_send_message when you need an agent to do work.",
+          parameters: Type.Object({
+            target: Type.String({
+              description: "Target agent ID (e.g. 'art', 'audio', 'gamedev', 'uiux')",
+            }),
+            instruction: Type.String({
+              description: "What you want the agent to do — be specific and actionable",
+            }),
+          }),
+          async execute(_toolCallId, params) {
+            try {
+              const p = params as { target: string; instruction: string };
+              const task = dispatchTask(cfg, p.target, p.instruction, logger);
               return {
                 content: [
                   {
                     type: "text" as const,
-                    text: `Task ${p.task_id} is already in terminal state: ${result.status}. No action taken.`,
+                    text:
+                      `Task dispatched to ${p.target}.\n` +
+                      `  task_id: ${task.task_id}\n` +
+                      `  channel: #${task.channel_id}\n` +
+                      `  status: DISPATCHED (awaiting ACK)\n` +
+                      `The system will auto-retry if ${p.target} doesn't respond.`,
+                  },
+                ],
+                details: task,
+              };
+            } catch (err) {
+              return {
+                content: [{ type: "text" as const, text: `Error dispatching task: ${err}` }],
+                details: undefined,
+              };
+            }
+          },
+        },
+        { names: ["chatroom_dispatch_task"] },
+      );
+
+      // ── Tool: check task status ─────────────────────────────────────────────
+
+      api.registerTool(
+        {
+          name: "chatroom_task_status",
+          label: "Chatroom: Task Status",
+          description:
+            "Check the status of dispatched tasks. Shows active, completed, and failed tasks.",
+          parameters: Type.Object({
+            task_id: Type.Optional(
+              Type.String({
+                description: "Specific task ID to check, or omit for all active tasks",
+              }),
+            ),
+          }),
+          async execute(_toolCallId, params) {
+            try {
+              const p = params as { task_id?: string };
+              if (p.task_id) {
+                const task = readTaskRecord(cfg, p.task_id);
+                if (!task)
+                  return {
+                    content: [{ type: "text" as const, text: `Task ${p.task_id} not found` }],
+                    details: undefined,
+                  };
+                return {
+                  content: [{ type: "text" as const, text: JSON.stringify(task, null, 2) }],
+                  details: task,
+                };
+              }
+              const active = listTasksByStatus(cfg, "DISPATCHED", "ACKED", "PROCESSING", "TIMEOUT");
+              if (active.length === 0)
+                return {
+                  content: [{ type: "text" as const, text: "No active tasks." }],
+                  details: undefined,
+                };
+              const summary = active.map((t) => ({
+                task_id: t.task_id,
+                to: t.to,
+                status: t.status,
+                instruction: t.instruction.slice(0, 80),
+                dispatched_at: t.dispatched_at,
+                retries: t.retries,
+              }));
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: `${active.length} active task(s):\n${JSON.stringify(summary, null, 2)}`,
+                  },
+                ],
+                details: summary,
+              };
+            } catch (err) {
+              return {
+                content: [{ type: "text" as const, text: `Error: ${err}` }],
+                details: undefined,
+              };
+            }
+          },
+        },
+        { names: ["chatroom_task_status"] },
+      );
+
+      // ── Tool: cancel / terminate a task ──────────────────────────────────
+
+      api.registerTool(
+        {
+          name: "chatroom_cancel_task",
+          label: "Chatroom: Cancel Task",
+          description:
+            "Cancel an active task. Use this when:\n" +
+            "  - A task is stuck (agent cannot complete it)\n" +
+            "  - You want to reassign the work to a different agent\n" +
+            "  - The task is no longer needed\n" +
+            "Sets the task status to CANCELLED, notifies the target agent, and resets their status to idle.",
+          parameters: Type.Object({
+            task_id: Type.String({ description: "The task ID to cancel" }),
+            reason: Type.Optional(
+              Type.String({ description: "Why the task is being cancelled (shown to the agent)" }),
+            ),
+          }),
+          async execute(_toolCallId, params) {
+            try {
+              const p = params as { task_id: string; reason?: string };
+              const reason = p.reason ?? "Cancelled by orchestrator";
+              const result = cancelTask(cfg, p.task_id, reason, logger);
+              if (!result) {
+                return {
+                  content: [{ type: "text" as const, text: `Task ${p.task_id} not found.` }],
+                  details: undefined,
+                };
+              }
+              if (result.status !== "CANCELLED") {
+                return {
+                  content: [
+                    {
+                      type: "text" as const,
+                      text: `Task ${p.task_id} is already in terminal state: ${result.status}. No action taken.`,
+                    },
+                  ],
+                  details: result,
+                };
+              }
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text:
+                      `Task ${p.task_id} cancelled.\n` +
+                      `  Target: ${result.to}\n` +
+                      `  Previous status: ${result.status}\n` +
+                      `  Reason: ${reason}\n` +
+                      `  Agent ${result.to} status reset to idle.`,
                   },
                 ],
                 details: result,
               };
+            } catch (err) {
+              return {
+                content: [{ type: "text" as const, text: `Error: ${err}` }],
+                details: undefined,
+              };
             }
-            return {
-              content: [
-                {
-                  type: "text" as const,
-                  text:
-                    `Task ${p.task_id} cancelled.\n` +
-                    `  Target: ${result.to}\n` +
-                    `  Previous status: ${result.status}\n` +
-                    `  Reason: ${reason}\n` +
-                    `  Agent ${result.to} status reset to idle.`,
-                },
-              ],
-              details: result,
-            };
-          } catch (err) {
-            return {
-              content: [{ type: "text" as const, text: `Error: ${err}` }],
-              details: undefined,
-            };
-          }
+          },
         },
-      },
-      { names: ["chatroom_cancel_task"] },
-    );
+        { names: ["chatroom_cancel_task"] },
+      );
+    } // end orchestrator-only tools
+
+    // ── Shared tools (available to ALL agents) ────────────────────────────
 
     // ── Tool: save asset to NAS ───────────────────────────────────────────
 
@@ -1259,6 +1326,20 @@ const agentChatroomPlugin = {
               mentions?: string[];
               asset_paths?: string[];
             };
+
+            // Workers cannot post to #general — orchestrator-only channel
+            if (cfg.role !== "orchestrator" && p.channel_id === "general") {
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: `Blocked: #general is reserved for the orchestrator. Use your DM channel (dm_${cfg.agentId}) instead.`,
+                  },
+                ],
+                details: undefined,
+              };
+            }
+
             const metadata: Record<string, any> = {};
             if (p.asset_paths?.length) metadata.asset_paths = p.asset_paths;
             const result = sendMessageToNAS(
@@ -1341,6 +1422,20 @@ const agentChatroomPlugin = {
               text?: string;
               task_id?: string;
             };
+
+            // Workers cannot post to #general
+            if (cfg.role !== "orchestrator" && p.channel_id === "general") {
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: `Blocked: #general is reserved for the orchestrator. Use your DM channel (dm_${cfg.agentId}) instead.`,
+                  },
+                ],
+                details: undefined,
+              };
+            }
+
             const dir = p.task_id
               ? taskAssetsDir(cfg, cfg.agentId, p.task_id)
               : assetsDir(cfg, cfg.agentId);
@@ -1470,7 +1565,9 @@ const agentChatroomPlugin = {
     api.registerService({
       id: "chatroom-daemon",
       start: async () => {
-        logger.info(`Chatroom daemon started for agent=${agentId} (task protocol enabled)`);
+        logger.info(
+          `Chatroom daemon started for agent=${agentId}, role=${cfg.role.toUpperCase()} (task protocol enabled)`,
+        );
         updateHeartbeat(cfg);
 
         heartbeatTimer = setInterval(() => {
@@ -1482,11 +1579,22 @@ const agentChatroomPlugin = {
         }, 30_000);
 
         // Main inbox poll — routes messages by type
+        const myDM = `dm_${cfg.agentId}`;
         pollTimer = setInterval(async () => {
           try {
             const messages = pollInbox(cfg);
             for (const msg of messages) {
               try {
+                // ── Hard gate: workers ONLY process their own DM channel ──
+                if (cfg.role !== "orchestrator") {
+                  if (msg.channel_id !== myDM) {
+                    logger.info(
+                      `[worker] Dropping message from #${msg.channel_id} (only DM allowed)`,
+                    );
+                    continue;
+                  }
+                }
+
                 switch (msg.type) {
                   case "TASK_DISPATCH":
                     handleIncomingTask(cfg, msg, runtime, config, logger);
@@ -1512,14 +1620,16 @@ const agentChatroomPlugin = {
           }
         }, pollIntervalMs);
 
-        // Task timeout / retry monitor
-        taskMonitorTimer = setInterval(() => {
-          try {
-            monitorPendingTasks(cfg, logger);
-          } catch {
-            /* ignore */
-          }
-        }, taskMonitorIntervalMs);
+        // Task timeout / retry monitor (orchestrator only — workers don't dispatch tasks)
+        if (cfg.role === "orchestrator") {
+          taskMonitorTimer = setInterval(() => {
+            try {
+              monitorPendingTasks(cfg, logger);
+            } catch {
+              /* ignore */
+            }
+          }, taskMonitorIntervalMs);
+        }
       },
       stop: async () => {
         if (heartbeatTimer) clearInterval(heartbeatTimer);

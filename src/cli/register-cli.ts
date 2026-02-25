@@ -88,6 +88,7 @@ function updateLocalConfig(agentId: string, nasRoot?: string): void {
   }
 
   cfg.plugins.entries["agent-chatroom"].config.agentId = agentId;
+  cfg.plugins.entries["agent-chatroom"].config.role = "worker";
   if (nasRoot) {
     cfg.plugins.entries["agent-chatroom"].config.nasRoot = nasRoot;
   }
@@ -134,9 +135,21 @@ function runRegister(category: string, displayName: string, opts: RegisterOption
     process.exit(1);
   }
 
-  const chatroomRoot = path.join(nasRoot, "chatroom");
+  // Normalize NAS root: fix broken UNC paths where \\ was reduced to \ by shell escaping
+  let normalizedNasRoot = nasRoot;
+  if (/^\\[^\\]/.test(normalizedNasRoot)) {
+    normalizedNasRoot = "\\" + normalizedNasRoot;
+  }
+  // Also accept forward-slash UNC (//SERVER/share) and convert to native format
+  if (normalizedNasRoot.startsWith("//")) {
+    normalizedNasRoot = normalizedNasRoot.replace(/\//g, path.sep);
+  }
+
+  const chatroomRoot = path.join(normalizedNasRoot, "chatroom");
   if (!fs.existsSync(chatroomRoot)) {
     console.error(`Error: Chatroom root not found at ${chatroomRoot}. Is the NAS mounted?`);
+    console.error(`\nTip: On Windows, try forward slashes to avoid escaping issues:`);
+    console.error(`  --nas-root "//FFUS_NAS/Projects"`);
     process.exit(1);
   }
 
