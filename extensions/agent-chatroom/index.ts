@@ -888,7 +888,7 @@ function scheduleGatewayRestart(projectRoot: string, logger: Logger): void {
   logger.info(`[self-update] Restart helper spawned (pid=${helper.pid}), relaunching in 3s`);
 }
 
-function pollInbox(cfg: ChatroomConfig): InboxMessage[] {
+function pollInbox(cfg: ChatroomConfig, logger?: Logger): InboxMessage[] {
   const root = chatroomRoot(cfg);
   const inboxDir = path.join(root, "inbox", cfg.agentId);
   if (!fs.existsSync(inboxDir)) return [];
@@ -903,7 +903,15 @@ function pollInbox(cfg: ChatroomConfig): InboxMessage[] {
     const filePath = path.join(inboxDir, file);
     try {
       const notif = readJson(filePath);
-      if (!notif) continue;
+      if (!notif) {
+        logger?.warn(`[pollInbox] Unreadable notification (null JSON): ${file}`);
+        try {
+          fs.unlinkSync(filePath);
+        } catch {
+          /* best-effort cleanup */
+        }
+        continue;
+      }
 
       let resolved = false;
 
@@ -970,9 +978,15 @@ function pollInbox(cfg: ChatroomConfig): InboxMessage[] {
         });
       }
 
+      if (!resolved) {
+        logger?.warn(
+          `[pollInbox] Could not resolve notification ${file} (ch=${notif.channel_id}, seq=${notif.message_seq}) — skipping`,
+        );
+      }
+
       fs.unlinkSync(filePath);
-    } catch {
-      /* skip */
+    } catch (err) {
+      logger?.error(`[pollInbox] Error processing ${file}: ${err}`);
     }
   }
 
@@ -3245,9 +3259,14 @@ const agentChatroomPlugin = {
       id: "chatroom-daemon",
       start: async () => {
         logger.info(
-          `Chatroom daemon started for agent=${agentId}, role=${cfg.role.toUpperCase()} (task protocol enabled)`,
+          `Chatroom daemon starting for agent=${agentId}, role=${cfg.role.toUpperCase()} (task protocol enabled)`,
         );
-        updateHeartbeat(cfg);
+
+        try {
+          updateHeartbeat(cfg);
+        } catch (err) {
+          logger.error(`[daemon] Initial heartbeat failed (NAS write issue?): ${err}`);
+        }
 
         // Post-update version report
         try {
@@ -3280,12 +3299,43 @@ const agentChatroomPlugin = {
           }
         }, 30_000);
 
+        logger.info(
+          `[daemon] Inbox poll timer started (interval=${pollIntervalMs}ms, inbox=${path.join(chatroomRoot(cfg), "inbox", cfg.agentId)})`,
+        );
+
         // Main inbox poll — routes messages by type
         const myDM = `dm_${cfg.agentId}`;
+        let pollCycleCount = 0;
+        let totalMsgProcessed = 0;
+        const inboxDirForLog = path.join(chatroomRoot(cfg), "inbox", cfg.agentId);
+
         pollTimer = setInterval(async () => {
+          pollCycleCount++;
+
+          // Periodic health log every ~60s (at default 3s interval → every 20 cycles)
+          if (pollCycleCount % 20 === 1) {
+            const inboxExists = fs.existsSync(inboxDirForLog);
+            let pendingFiles = 0;
+            if (inboxExists) {
+              try {
+                pendingFiles = fs
+                  .readdirSync(inboxDirForLog)
+                  .filter((f) => f.endsWith(".json")).length;
+              } catch {
+                /* ignore */
+              }
+            }
+            logger.info(
+              `[poll] Health: cycle=${pollCycleCount}, processed=${totalMsgProcessed}, ` +
+                `inbox=${inboxExists ? "OK" : "MISSING"}, pending=${pendingFiles}, ` +
+                `path=${inboxDirForLog}`,
+            );
+          }
+
           try {
-            const messages = pollInbox(cfg);
+            const messages = pollInbox(cfg, logger);
             for (const msg of messages) {
+              totalMsgProcessed++;
               try {
                 // ── System command gate: self-update bypasses DM restriction ──
                 if (isSelfUpdateCommand(msg)) {
@@ -3369,8 +3419,8 @@ const agentChatroomPlugin = {
                 logger.error(`Message handling failed for ${msg.message_id}: ${err}`);
               }
             }
-          } catch {
-            /* ignore */
+          } catch (err) {
+            logger.error(`[poll] Poll cycle failed: ${err}`);
           }
         }, pollIntervalMs);
 
