@@ -533,6 +533,8 @@ function updateHeartbeat(cfg: ChatroomConfig): void {
 // ============================================================================
 
 const SELF_UPDATE_EXIT_CODE = 42;
+const UPGRADE_CHANNEL_ID = "upgrade";
+const SELF_UPDATE_MARKER = ".self-update-pending.json";
 
 function resolveGitRoot(): string | null {
   try {
@@ -544,6 +546,113 @@ function resolveGitRoot(): string | null {
   } catch {
     return null;
   }
+}
+
+function resolveProjectRoot(): string {
+  return resolveGitRoot() ?? process.cwd();
+}
+
+function readProjectVersion(): string {
+  const root = resolveProjectRoot();
+  const buildInfo = readJson(path.join(root, "dist", "build-info.json"));
+  if (buildInfo?.version) return buildInfo.version;
+  const pkg = readJson(path.join(root, "package.json"));
+  if (pkg?.version) return pkg.version;
+  return "unknown";
+}
+
+function readProjectCommit(): string {
+  const root = resolveProjectRoot();
+  const buildInfo = readJson(path.join(root, "dist", "build-info.json"));
+  if (buildInfo?.commit) return String(buildInfo.commit).slice(0, 8);
+  try {
+    return execSync("git rev-parse --short HEAD", {
+      cwd: root,
+      encoding: "utf-8",
+      timeout: 5_000,
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim();
+  } catch {
+    return "unknown";
+  }
+}
+
+function writeSelfUpdateMarker(cfg: ChatroomConfig, requestedBy: string): void {
+  const markerPath = path.join(resolveProjectRoot(), SELF_UPDATE_MARKER);
+  writeJson(markerPath, {
+    agent_id: cfg.agentId,
+    previous_version: readProjectVersion(),
+    requested_by: requestedBy,
+    timestamp: nowISO(),
+  });
+}
+
+function readAndClearSelfUpdateMarker(): {
+  agent_id: string;
+  previous_version: string;
+  requested_by: string;
+  timestamp: string;
+} | null {
+  const markerPath = path.join(resolveProjectRoot(), SELF_UPDATE_MARKER);
+  const data = readJson(markerPath);
+  if (!data) return null;
+  try {
+    fs.unlinkSync(markerPath);
+  } catch {
+    /* ignore */
+  }
+  return data;
+}
+
+function ensureUpgradeChannel(cfg: ChatroomConfig): void {
+  const root = chatroomRoot(cfg);
+  const indexPath = path.join(root, "channels", "_index.json");
+  const idx = readJson(indexPath);
+  if (!idx?.channels) return;
+
+  let upgradeChannel = idx.channels.find((ch: any) => ch.channel_id === UPGRADE_CHANNEL_ID);
+
+  if (!upgradeChannel) {
+    const allAgents = readAgentRegistry(cfg).map((a) => a.agent_id);
+    if (!allAgents.includes(cfg.agentId)) allAgents.push(cfg.agentId);
+    upgradeChannel = {
+      channel_id: UPGRADE_CHANNEL_ID,
+      display_name: "#upgrade",
+      type: "group",
+      members: allAgents,
+    };
+    idx.channels.push(upgradeChannel);
+    writeJson(indexPath, idx);
+  } else if (!upgradeChannel.members?.includes(cfg.agentId)) {
+    upgradeChannel.members.push(cfg.agentId);
+    writeJson(indexPath, idx);
+  }
+
+  const chDir = path.join(root, "channels", UPGRADE_CHANNEL_ID);
+  ensureDir(path.join(chDir, "messages"));
+  const metaPath = path.join(chDir, "meta.json");
+  if (!fs.existsSync(metaPath)) {
+    writeJson(metaPath, upgradeChannel);
+  } else {
+    const meta = readJson(metaPath);
+    if (meta && !meta.members?.includes(cfg.agentId)) {
+      meta.members.push(cfg.agentId);
+      writeJson(metaPath, meta);
+    }
+  }
+}
+
+function pauseActiveTasksForUpgrade(cfg: ChatroomConfig, logger: Logger): number {
+  const activeTasks = listTasksByStatus(cfg, "DISPATCHED", "ACKED", "PROCESSING");
+  const myTasks = activeTasks.filter((t) => t.to === cfg.agentId || t.from === cfg.agentId);
+  for (const task of myTasks) {
+    updateTaskRecord(cfg, task.task_id, {
+      status: "PARKED",
+      current_phase: "system_upgrade",
+    } as Partial<TaskRecord>);
+    logger.info(`[self-update] Parked task ${task.task_id} (was ${task.status})`);
+  }
+  return myTasks.length;
 }
 
 function isSelfUpdateCommand(msg: InboxMessage): boolean {
@@ -561,27 +670,34 @@ function isSelfUpdateAuthorized(msg: InboxMessage): boolean {
   return false;
 }
 
+function reportVersionToUpgrade(cfg: ChatroomConfig, extra?: string): void {
+  ensureUpgradeChannel(cfg);
+  const version = readProjectVersion();
+  const commit = readProjectCommit();
+  let text = `[${cfg.agentId}] 当前版本: v${version} (${commit})`;
+  if (extra) text += `\n${extra}`;
+  sendMessageToNAS(cfg, UPGRADE_CHANNEL_ID, text, "STATUS_UPDATE");
+}
+
 async function handleSelfUpdate(
   cfg: ChatroomConfig,
   msg: InboxMessage,
   logger: Logger,
 ): Promise<void> {
-  const projectRoot = resolveGitRoot() ?? process.cwd();
+  const projectRoot = resolveProjectRoot();
   logger.info(
     `[self-update] Received update command from ${msg.from} in #${msg.channel_id} (root: ${projectRoot})`,
   );
 
-  const reportChannel = msg.channel_id;
+  ensureUpgradeChannel(cfg);
 
   const sendStatus = (text: string) => {
     try {
-      sendMessageToNAS(cfg, reportChannel, text, "STATUS_UPDATE");
+      sendMessageToNAS(cfg, UPGRADE_CHANNEL_ID, text, "STATUS_UPDATE");
     } catch (err) {
       logger.warn(`[self-update] Failed to send status: ${err}`);
     }
   };
-
-  sendStatus(`[${cfg.agentId}] 收到更新指令，正在拉取最新代码...`);
 
   try {
     logger.info("[self-update] Running git pull...");
@@ -593,13 +709,16 @@ async function handleSelfUpdate(
     logger.info(`[self-update] git pull: ${pullOutput}`);
 
     if (pullOutput === "Already up to date.") {
-      sendStatus(`[${cfg.agentId}] 当前已是最新版本，无需更新。`);
+      reportVersionToUpgrade(cfg, "已是最新版本，无需更新。");
       return;
     }
 
-    // Only pull here; install + build happen AFTER the gateway exits,
-    // handled by run-node.mjs which detects exit code 42.
-    sendStatus(`[${cfg.agentId}] 代码已更新，正在关闭 gateway 进行重建和重启...`);
+    const parkedCount = pauseActiveTasksForUpgrade(cfg, logger);
+    const parkedNote = parkedCount > 0 ? ` (已暂停 ${parkedCount} 个进行中的任务)` : "";
+
+    writeSelfUpdateMarker(cfg, msg.from);
+
+    sendStatus(`[${cfg.agentId}] 代码已拉取，正在关闭 gateway 进行重建和重启...${parkedNote}`);
     logger.info(
       "[self-update] Code pulled. Exiting with code 42 — run-node.mjs will install, build, and relaunch.",
     );
@@ -2966,6 +3085,28 @@ const agentChatroomPlugin = {
           `Chatroom daemon started for agent=${agentId}, role=${cfg.role.toUpperCase()} (task protocol enabled)`,
         );
         updateHeartbeat(cfg);
+
+        // Post-update version report
+        try {
+          const marker = readAndClearSelfUpdateMarker();
+          if (marker) {
+            const newVersion = readProjectVersion();
+            const commit = readProjectCommit();
+            ensureUpgradeChannel(cfg);
+            const prev = marker.previous_version;
+            sendMessageToNAS(
+              cfg,
+              UPGRADE_CHANNEL_ID,
+              `[${cfg.agentId}] 更新完成并已重启。版本: v${prev} -> v${newVersion} (${commit})`,
+              "STATUS_UPDATE",
+            );
+            logger.info(
+              `[self-update] Post-restart report: v${prev} -> v${newVersion} (${commit})`,
+            );
+          }
+        } catch (err) {
+          logger.warn(`[self-update] Failed to send post-restart report: ${err}`);
+        }
 
         heartbeatTimer = setInterval(() => {
           try {
