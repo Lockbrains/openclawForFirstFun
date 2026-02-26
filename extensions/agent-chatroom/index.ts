@@ -659,6 +659,8 @@ function isSelfUpdateCommand(msg: InboxMessage): boolean {
   if (msg.metadata?.system_command === "self_update") return true;
   const text = msg.content?.text?.trim() ?? "";
   if (/^\/system-update\b/i.test(text)) return true;
+  // #upgrade is a dedicated channel: any non-report message is an update trigger
+  if (msg.channel_id === UPGRADE_CHANNEL_ID && msg.type !== "STATUS_UPDATE") return true;
   return false;
 }
 
@@ -674,7 +676,7 @@ function reportVersionToUpgrade(cfg: ChatroomConfig, extra?: string): void {
   ensureUpgradeChannel(cfg);
   const version = readProjectVersion();
   const commit = readProjectCommit();
-  let text = `[${cfg.agentId}] 当前版本: v${version} (${commit})`;
+  let text = `[${cfg.agentId}] Current version: v${version} (${commit})`;
   if (extra) text += `\n${extra}`;
   sendMessageToNAS(cfg, UPGRADE_CHANNEL_ID, text, "STATUS_UPDATE");
 }
@@ -709,16 +711,16 @@ async function handleSelfUpdate(
     logger.info(`[self-update] git pull: ${pullOutput}`);
 
     if (pullOutput === "Already up to date.") {
-      reportVersionToUpgrade(cfg, "已是最新版本，无需更新。");
+      reportVersionToUpgrade(cfg, "Already up to date.");
       return;
     }
 
     const parkedCount = pauseActiveTasksForUpgrade(cfg, logger);
-    const parkedNote = parkedCount > 0 ? ` (已暂停 ${parkedCount} 个进行中的任务)` : "";
+    const parkedNote = parkedCount > 0 ? ` (${parkedCount} active task(s) parked)` : "";
 
     writeSelfUpdateMarker(cfg, msg.from);
 
-    sendStatus(`[${cfg.agentId}] 代码已拉取，正在关闭 gateway 进行重建和重启...${parkedNote}`);
+    sendStatus(`[${cfg.agentId}] Code pulled. Shutting down for rebuild & restart...${parkedNote}`);
     logger.info(
       "[self-update] Code pulled. Exiting with code 42 — run-node.mjs will install, build, and relaunch.",
     );
@@ -730,7 +732,7 @@ async function handleSelfUpdate(
     const stdout = err.stdout?.toString?.() ?? "";
     const detail = stderr || stdout || err.message || String(err);
     logger.error(`[self-update] Update failed: ${detail}`);
-    sendStatus(`[${cfg.agentId}] 自动更新失败:\n${detail.slice(0, 500)}`);
+    sendStatus(`[${cfg.agentId}] Update failed:\n${detail.slice(0, 500)}`);
   }
 }
 
@@ -3097,7 +3099,7 @@ const agentChatroomPlugin = {
             sendMessageToNAS(
               cfg,
               UPGRADE_CHANNEL_ID,
-              `[${cfg.agentId}] 更新完成并已重启。版本: v${prev} -> v${newVersion} (${commit})`,
+              `[${cfg.agentId}] Update complete, restarted. Version: v${prev} -> v${newVersion} (${commit})`,
               "STATUS_UPDATE",
             );
             logger.info(
@@ -3132,6 +3134,11 @@ const agentChatroomPlugin = {
                       `[self-update] Unauthorized update request from ${msg.from}, ignoring`,
                     );
                   }
+                  continue;
+                }
+
+                // ── #upgrade is a system-only channel — never forward to LLM ──
+                if (msg.channel_id === UPGRADE_CHANNEL_ID) {
                   continue;
                 }
 
