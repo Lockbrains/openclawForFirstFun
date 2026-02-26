@@ -100,6 +100,8 @@ const shouldBuild = () => {
   return false;
 };
 
+const SELF_UPDATE_EXIT_CODE = 42;
+
 const logRunner = (message) => {
   if (env.FIRSTCLAW_RUNNER_LOG === "0") {
     return;
@@ -107,7 +109,43 @@ const logRunner = (message) => {
   process.stderr.write(`[firstclaw] ${message}\n`);
 };
 
-const runNode = () => {
+const writeBuildStamp = () => {
+  try {
+    fs.mkdirSync(distRoot, { recursive: true });
+    fs.writeFileSync(buildStampPath, `${Date.now()}\n`);
+  } catch (error) {
+    logRunner(`Failed to write build stamp: ${error?.message ?? "unknown error"}`);
+  }
+};
+
+const spawnSequence = (steps, onDone) => {
+  const next = (i) => {
+    if (i >= steps.length) {
+      onDone();
+      return;
+    }
+    const { cmd, args: stepArgs, label } = steps[i];
+    logRunner(label);
+    const proc = spawn(cmd, stepArgs, { cwd, env, stdio: "inherit" });
+    proc.on("exit", (code, signal) => {
+      if (signal) {
+        process.exit(1);
+      }
+      if (code !== 0 && code !== null) {
+        logRunner(`${label} failed with code ${code}`);
+        process.exit(code);
+      }
+      next(i + 1);
+    });
+  };
+  next(0);
+};
+
+const pnpmCmd = process.platform === "win32" ? "cmd.exe" : "pnpm";
+const pnpmArgs = (subArgs) =>
+  process.platform === "win32" ? ["/d", "/s", "/c", "pnpm", ...subArgs] : subArgs;
+
+const launchNode = () => {
   const nodeProcess = spawn(process.execPath, ["firstclaw.mjs", ...args], {
     cwd,
     env,
@@ -115,6 +153,11 @@ const runNode = () => {
   });
 
   nodeProcess.on("exit", (exitCode, exitSignal) => {
+    if (exitCode === SELF_UPDATE_EXIT_CODE) {
+      logRunner("Self-update requested; gateway stopped. Running install + build...");
+      selfUpdateRebuild();
+      return;
+    }
     if (exitSignal) {
       process.exit(1);
     }
@@ -122,37 +165,46 @@ const runNode = () => {
   });
 };
 
-const writeBuildStamp = () => {
-  try {
-    fs.mkdirSync(distRoot, { recursive: true });
-    fs.writeFileSync(buildStampPath, `${Date.now()}\n`);
-  } catch (error) {
-    // Best-effort stamp; still allow the runner to start.
-    logRunner(`Failed to write build stamp: ${error?.message ?? "unknown error"}`);
+const selfUpdateRebuild = () => {
+  spawnSequence(
+    [
+      {
+        cmd: pnpmCmd,
+        args: pnpmArgs(["install", "--frozen-lockfile"]),
+        label: "Installing dependencies...",
+      },
+      { cmd: pnpmCmd, args: pnpmArgs(["build"]), label: "Building project..." },
+    ],
+    () => {
+      writeBuildStamp();
+      logRunner("Self-update rebuild complete; re-launching...");
+      launchNode();
+    },
+  );
+};
+
+const startLoop = () => {
+  if (!shouldBuild()) {
+    launchNode();
+  } else {
+    logRunner("Building TypeScript (dist is stale).");
+    const build = spawn(pnpmCmd, pnpmArgs(compilerArgs), {
+      cwd,
+      env,
+      stdio: "inherit",
+    });
+
+    build.on("exit", (code, signal) => {
+      if (signal) {
+        process.exit(1);
+      }
+      if (code !== 0 && code !== null) {
+        process.exit(code);
+      }
+      writeBuildStamp();
+      launchNode();
+    });
   }
 };
 
-if (!shouldBuild()) {
-  runNode();
-} else {
-  logRunner("Building TypeScript (dist is stale).");
-  const buildCmd = process.platform === "win32" ? "cmd.exe" : "pnpm";
-  const buildArgs =
-    process.platform === "win32" ? ["/d", "/s", "/c", "pnpm", ...compilerArgs] : compilerArgs;
-  const build = spawn(buildCmd, buildArgs, {
-    cwd,
-    env,
-    stdio: "inherit",
-  });
-
-  build.on("exit", (code, signal) => {
-    if (signal) {
-      process.exit(1);
-    }
-    if (code !== 0 && code !== null) {
-      process.exit(code);
-    }
-    writeBuildStamp();
-    runNode();
-  });
-}
+startLoop();

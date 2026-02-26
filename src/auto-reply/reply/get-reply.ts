@@ -101,7 +101,9 @@ export async function getReplyFromConfig(
   });
   const workspaceDir = workspace.dir;
   const agentDir = resolveAgentDir(cfg, agentId);
-  const timeoutMs = resolveAgentTimeoutMs({ cfg });
+  const timeoutMs = opts?.agentTimeoutMs
+    ? resolveAgentTimeoutMs({ cfg, overrideMs: opts.agentTimeoutMs })
+    : resolveAgentTimeoutMs({ cfg });
   const configuredTypingSeconds =
     agentCfg?.typingIntervalSeconds ?? sessionCfg?.typingIntervalSeconds;
   const typingIntervalSeconds =

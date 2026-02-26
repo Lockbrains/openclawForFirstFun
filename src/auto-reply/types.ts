@@ -43,6 +43,8 @@ export type GetReplyOptions = {
   hasRepliedRef?: { value: boolean };
   /** Block tools matching these names during this dispatch. Supports trailing wildcards (e.g. "feishu_*"). */
   toolsDeny?: string[];
+  /** Override the agent run timeout in milliseconds. Bypasses the config default. */
+  agentTimeoutMs?: number;
 };
 
 export type ReplyPayload = {

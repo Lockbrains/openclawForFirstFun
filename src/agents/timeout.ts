@@ -1,19 +1,26 @@
 import type { FirstClawConfig } from "../config/config.js";
 
-// FirstClaw: Reduced default timeout from 600s to 120s to limit runaway cost.
-// Hard ceiling ensures no single agent run can exceed 5 minutes.
 const DEFAULT_AGENT_TIMEOUT_SECONDS = 120;
 const MAX_AGENT_TIMEOUT_SECONDS = 300;
+const MAX_LONG_RUNNING_TIMEOUT_SECONDS = 3600;
 const MAX_SAFE_TIMEOUT_MS = 2_147_000_000;
+
+export type AgentTimeoutTier = "standard" | "long_running";
 
 const normalizeNumber = (value: unknown): number | undefined =>
   typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : undefined;
 
-export function resolveAgentTimeoutSeconds(cfg?: FirstClawConfig): number {
+function ceilingForTier(tier: AgentTimeoutTier): number {
+  return tier === "long_running" ? MAX_LONG_RUNNING_TIMEOUT_SECONDS : MAX_AGENT_TIMEOUT_SECONDS;
+}
+
+export function resolveAgentTimeoutSeconds(
+  cfg?: FirstClawConfig,
+  tier: AgentTimeoutTier = "standard",
+): number {
   const raw = normalizeNumber(cfg?.agents?.defaults?.timeoutSeconds);
   const seconds = raw ?? DEFAULT_AGENT_TIMEOUT_SECONDS;
-  // FirstClaw: Enforce hard ceiling on agent timeout
-  return Math.min(Math.max(seconds, 1), MAX_AGENT_TIMEOUT_SECONDS);
+  return Math.min(Math.max(seconds, 1), ceilingForTier(tier));
 }
 
 export function resolveAgentTimeoutMs(opts: {
@@ -21,12 +28,16 @@ export function resolveAgentTimeoutMs(opts: {
   overrideMs?: number | null;
   overrideSeconds?: number | null;
   minMs?: number;
+  tier?: AgentTimeoutTier;
 }): number {
+  const tier = opts.tier ?? "standard";
   const minMs = Math.max(normalizeNumber(opts.minMs) ?? 1, 1);
-  const clampTimeoutMs = (valueMs: number) =>
+  const clampOverride = (valueMs: number) =>
     Math.min(Math.max(valueMs, minMs), MAX_SAFE_TIMEOUT_MS);
-  const defaultMs = clampTimeoutMs(resolveAgentTimeoutSeconds(opts.cfg) * 1000);
-  // Use the maximum timer-safe timeout to represent "no timeout" when explicitly set to 0.
+  const defaultMs = Math.min(
+    Math.max(resolveAgentTimeoutSeconds(opts.cfg, tier) * 1000, minMs),
+    ceilingForTier(tier) * 1000,
+  );
   const NO_TIMEOUT_MS = MAX_SAFE_TIMEOUT_MS;
   const overrideMs = normalizeNumber(opts.overrideMs);
   if (overrideMs !== undefined) {
@@ -36,7 +47,7 @@ export function resolveAgentTimeoutMs(opts: {
     if (overrideMs < 0) {
       return defaultMs;
     }
-    return clampTimeoutMs(overrideMs);
+    return clampOverride(overrideMs);
   }
   const overrideSeconds = normalizeNumber(opts.overrideSeconds);
   if (overrideSeconds !== undefined) {
@@ -46,7 +57,7 @@ export function resolveAgentTimeoutMs(opts: {
     if (overrideSeconds < 0) {
       return defaultMs;
     }
-    return clampTimeoutMs(overrideSeconds * 1000);
+    return clampOverride(overrideSeconds * 1000);
   }
   return defaultMs;
 }

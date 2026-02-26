@@ -22,6 +22,7 @@
 import type { FirstClawPluginApi } from "firstclaw/plugin-sdk";
 import { Type } from "@sinclair/typebox";
 import { createReplyPrefixContext, type ReplyPayload } from "firstclaw/plugin-sdk";
+import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -63,7 +64,17 @@ type TaskStatus =
   | "FAILED"
   | "TIMEOUT"
   | "ABANDONED"
-  | "CANCELLED";
+  | "CANCELLED"
+  | "RETRYING"
+  | "PARKED";
+
+type TaskErrorType = "CONTEXT_OVERFLOW" | "RATE_LIMITED" | "LLM_ERROR" | "TOOL_ERROR";
+
+interface ProgressEntry {
+  timestamp: string;
+  phase: string;
+  detail?: string;
+}
 
 interface TaskRecord {
   task_id: string;
@@ -82,6 +93,59 @@ interface TaskRecord {
   max_retries: number;
   ack_timeout_ms: number;
   task_timeout_ms: number;
+  error_type?: TaskErrorType | null;
+  error_detail?: string | null;
+  progress_log?: ProgressEntry[];
+  current_phase?: string | null;
+}
+
+type ParkWatchType = "shell" | "file" | "poll_url" | "permission";
+
+interface ParkedTaskInfo {
+  task_id: string;
+  agent_id: string;
+  channel_id: string;
+  original_instruction: string;
+  resume_prompt: string;
+  watch_type: ParkWatchType;
+  watch_config: {
+    command?: string;
+    file_path?: string;
+    url?: string;
+    expected_status?: number;
+    permission_id?: string;
+  };
+  poll_interval_ms: number;
+  max_wait_ms: number;
+  parked_at: string;
+  last_poll_at: string | null;
+  poll_count: number;
+}
+
+interface PermissionRecord {
+  permission_id: string;
+  task_id: string;
+  agent_id: string;
+  channel_id: string;
+  status: "pending" | "approved" | "rejected" | "allowlisted";
+  operation: {
+    type: string;
+    command?: string;
+    path?: string;
+    url?: string;
+    pattern: string;
+    working_dir?: string;
+  };
+  summary: string;
+  context_snapshot: {
+    original_instruction: string;
+    resume_prompt: string;
+  };
+  requested_at: string;
+  decided_at: string | null;
+  decided_by: string | null;
+  decision: string | null;
+  decision_reason: string | null;
 }
 
 interface Logger {
@@ -198,6 +262,158 @@ function scanOutputDir(dir: string): string[] {
   return files;
 }
 
+// ============================================================================
+// Permission helpers
+// ============================================================================
+
+function permissionsDir(cfg: ChatroomConfig): string {
+  return path.join(chatroomRoot(cfg), "permissions");
+}
+
+function permissionAllowlistPath(cfg: ChatroomConfig): string {
+  return path.join(chatroomRoot(cfg), "config", "permission_allowlist.json");
+}
+
+function writePermissionRecord(cfg: ChatroomConfig, record: PermissionRecord): void {
+  const dir = permissionsDir(cfg);
+  ensureDir(dir);
+  writeJson(path.join(dir, `${record.permission_id}.json`), record);
+}
+
+function readPermissionRecord(cfg: ChatroomConfig, permissionId: string): PermissionRecord | null {
+  return readJson(path.join(permissionsDir(cfg), `${permissionId}.json`));
+}
+
+function readAllowlist(cfg: ChatroomConfig): {
+  patterns: Array<{ pattern: string; added_by: string; added_at: string }>;
+} {
+  const data = readJson(permissionAllowlistPath(cfg));
+  return data?.patterns ? data : { patterns: [] };
+}
+
+function buildOperationPattern(opType: string, opDetail: string): string {
+  const typeName = opType.charAt(0).toUpperCase() + opType.slice(1);
+  if (opType === "shell") {
+    const cmd = opDetail.split(/\s+/)[0] ?? opDetail;
+    return `${typeName}(${cmd}:*)`;
+  }
+  // For file operations, create a directory-level glob
+  const normalized = opDetail.replace(/\\/g, "/");
+  const lastSlash = normalized.lastIndexOf("/");
+  const dirPart = lastSlash > 0 ? normalized.slice(0, lastSlash) : normalized;
+  return `${typeName}(${dirPart}/**)`;
+}
+
+function matchesAllowlist(cfg: ChatroomConfig, opType: string, opDetail: string): boolean {
+  const allowlist = readAllowlist(cfg);
+  if (allowlist.patterns.length === 0) return false;
+
+  const typeName = opType.charAt(0).toUpperCase() + opType.slice(1);
+
+  for (const entry of allowlist.patterns) {
+    const pat = entry.pattern;
+    // Parse pattern: Type(glob)
+    const match = pat.match(/^(\w+)\((.+)\)$/);
+    if (!match) continue;
+    const [, patType, patGlob] = match;
+    if (patType !== typeName) continue;
+
+    if (opType === "shell") {
+      // Shell patterns: "Shell(cmd:argGlob)" or "Shell(cmd:*)"
+      const colonIdx = patGlob.indexOf(":");
+      if (colonIdx === -1) {
+        // Simple command match: Shell(git)
+        const cmd = opDetail.split(/\s+/)[0] ?? "";
+        if (cmd === patGlob) return true;
+      } else {
+        const patCmd = patGlob.slice(0, colonIdx);
+        const patArgGlob = patGlob.slice(colonIdx + 1);
+        const cmd = opDetail.split(/\s+/)[0] ?? "";
+        if (cmd !== patCmd) continue;
+        if (patArgGlob === "*") return true;
+        // Simple prefix match for arg patterns
+        const args = opDetail.slice(cmd.length).trim();
+        const argPrefix = patArgGlob.replace(/\*+$/, "");
+        if (args.startsWith(argPrefix)) return true;
+      }
+    } else {
+      // File/network patterns: glob matching on paths
+      const normalized = opDetail.replace(/\\/g, "/");
+      const globPrefix = patGlob.replace(/\*+$/, "");
+      if (normalized.startsWith(globPrefix)) return true;
+    }
+  }
+  return false;
+}
+
+function createPermissionRequest(
+  cfg: ChatroomConfig,
+  taskId: string,
+  agentId: string,
+  channelId: string,
+  opType: string,
+  opDetail: string,
+  summary: string,
+  originalInstruction: string,
+  resumePrompt: string,
+  logger: Logger,
+): PermissionRecord {
+  const permissionId = randomUUID();
+  const pattern = buildOperationPattern(opType, opDetail);
+
+  const operation: PermissionRecord["operation"] = {
+    type: opType,
+    pattern,
+  };
+  if (opType === "shell") operation.command = opDetail;
+  else if (opType === "write" || opType === "read") operation.path = opDetail;
+  else if (opType === "network") operation.url = opDetail;
+  else operation.command = opDetail;
+
+  const record: PermissionRecord = {
+    permission_id: permissionId,
+    task_id: taskId,
+    agent_id: agentId,
+    channel_id: channelId,
+    status: "pending",
+    operation,
+    summary,
+    context_snapshot: {
+      original_instruction: originalInstruction,
+      resume_prompt: resumePrompt,
+    },
+    requested_at: nowISO(),
+    decided_at: null,
+    decided_by: null,
+    decision: null,
+    decision_reason: null,
+  };
+
+  writePermissionRecord(cfg, record);
+
+  // Post PERMISSION_REQUEST message to #permission channel
+  const msgText = [
+    `**Permission Required** for task \`${taskId.slice(0, 8)}...\``,
+    `**Agent:** ${agentId}`,
+    `**Operation:** \`${opDetail}\``,
+    ``,
+    summary,
+  ].join("\n");
+
+  sendMessageToNAS(cfg, "permission", msgText, "PERMISSION_REQUEST", [], undefined, {
+    permission_id: permissionId,
+    permission_status: "pending",
+    permission_operation: operation,
+    permission_summary: summary,
+    task_id: taskId,
+  });
+
+  logger.info(
+    `Permission request ${permissionId} created for task ${taskId} (${opType}: ${opDetail.slice(0, 60)})`,
+  );
+  return record;
+}
+
 function readAgentRegistry(cfg: ChatroomConfig): AgentRegistryEntry[] {
   const regDir = path.join(chatroomRoot(cfg), "registry");
   if (!fs.existsSync(regDir)) return [];
@@ -310,6 +526,93 @@ function updateHeartbeat(cfg: ChatroomConfig): void {
   info.last_heartbeat = nowISO();
   if (info.status === "offline") info.status = "idle";
   writeJson(regPath, info);
+}
+
+// ============================================================================
+// Self-update: git pull → exit(42) → run-node.mjs handles install + build + relaunch
+// ============================================================================
+
+const SELF_UPDATE_EXIT_CODE = 42;
+
+function resolveGitRoot(): string | null {
+  try {
+    return execSync("git rev-parse --show-toplevel", {
+      encoding: "utf-8",
+      timeout: 5_000,
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
+function isSelfUpdateCommand(msg: InboxMessage): boolean {
+  if (msg.metadata?.system_command === "self_update") return true;
+  const text = msg.content?.text?.trim() ?? "";
+  if (/^\/system-update\b/i.test(text)) return true;
+  return false;
+}
+
+function isSelfUpdateAuthorized(msg: InboxMessage): boolean {
+  const from = msg.from ?? "";
+  if (from.startsWith("human:")) return true;
+  if (from === "firstclaw") return true;
+  if (msg.metadata?.system_command === "self_update") return true;
+  return false;
+}
+
+async function handleSelfUpdate(
+  cfg: ChatroomConfig,
+  msg: InboxMessage,
+  logger: Logger,
+): Promise<void> {
+  const projectRoot = resolveGitRoot() ?? process.cwd();
+  logger.info(
+    `[self-update] Received update command from ${msg.from} in #${msg.channel_id} (root: ${projectRoot})`,
+  );
+
+  const reportChannel = msg.channel_id;
+
+  const sendStatus = (text: string) => {
+    try {
+      sendMessageToNAS(cfg, reportChannel, text, "STATUS_UPDATE");
+    } catch (err) {
+      logger.warn(`[self-update] Failed to send status: ${err}`);
+    }
+  };
+
+  sendStatus(`[${cfg.agentId}] 收到更新指令，正在拉取最新代码...`);
+
+  try {
+    logger.info("[self-update] Running git pull...");
+    const pullOutput = execSync("git pull --ff-only", {
+      cwd: projectRoot,
+      encoding: "utf-8",
+      timeout: 60_000,
+    }).trim();
+    logger.info(`[self-update] git pull: ${pullOutput}`);
+
+    if (pullOutput === "Already up to date.") {
+      sendStatus(`[${cfg.agentId}] 当前已是最新版本，无需更新。`);
+      return;
+    }
+
+    // Only pull here; install + build happen AFTER the gateway exits,
+    // handled by run-node.mjs which detects exit code 42.
+    sendStatus(`[${cfg.agentId}] 代码已更新，正在关闭 gateway 进行重建和重启...`);
+    logger.info(
+      "[self-update] Code pulled. Exiting with code 42 — run-node.mjs will install, build, and relaunch.",
+    );
+
+    await new Promise((r) => setTimeout(r, 500));
+    process.exit(SELF_UPDATE_EXIT_CODE);
+  } catch (err: any) {
+    const stderr = err.stderr?.toString?.() ?? "";
+    const stdout = err.stdout?.toString?.() ?? "";
+    const detail = stderr || stdout || err.message || String(err);
+    logger.error(`[self-update] Update failed: ${detail}`);
+    sendStatus(`[${cfg.agentId}] 自动更新失败:\n${detail.slice(0, 500)}`);
+  }
 }
 
 function pollInbox(cfg: ChatroomConfig): InboxMessage[] {
@@ -486,6 +789,7 @@ function dispatchTask(
     task_id: task.task_id,
     priority: "urgent",
     output_dir: outputDir,
+    task_timeout_ms: task.task_timeout_ms,
   });
 
   logger.info(`Task ${task.task_id} dispatched to ${to} via #${channelId} (output: ${outputDir})`);
@@ -508,7 +812,10 @@ function sendTaskResult(
   status: "DONE" | "FAILED",
   logger: Logger,
   assetPaths: string[] = [],
+  errorType?: TaskErrorType | null,
 ): void {
+  finalizeTaskProgress(cfg, taskId);
+
   const task = readTaskRecord(cfg, taskId);
   if (!task) {
     logger.warn(`Cannot send result — task ${taskId} not found`);
@@ -518,15 +825,24 @@ function sendTaskResult(
     task_id: taskId,
     status,
     asset_paths: assetPaths,
+    error_type: errorType ?? undefined,
   });
-  updateTaskRecord(cfg, taskId, {
+  const patch: Partial<TaskRecord> = {
     status,
     completed_at: nowISO(),
     result_summary: resultText.slice(0, 500),
     asset_paths: assetPaths,
-  });
+  };
+  if (errorType) {
+    patch.error_type = errorType;
+    patch.error_detail = resultText.slice(0, 2000);
+  }
+  patch.current_phase = status === "DONE" ? "completed" : "failed";
+  updateTaskRecord(cfg, taskId, patch);
   resetAgentStatus(cfg, task.to, logger);
-  logger.info(`Result sent for task ${taskId} (${status}) → ${task.from}`);
+  logger.info(
+    `Result sent for task ${taskId} (${status}${errorType ? ` [${errorType}]` : ""}) → ${task.from}`,
+  );
 }
 
 function cancelTask(
@@ -591,6 +907,412 @@ function resetAgentStatus(cfg: ChatroomConfig, agentId: string, logger: Logger):
 }
 
 // ============================================================================
+// Error classification
+// ============================================================================
+
+const ERROR_PATTERNS: Array<{ type: TaskErrorType; patterns: RegExp[] }> = [
+  {
+    type: "CONTEXT_OVERFLOW",
+    patterns: [
+      /context overflow/i,
+      /prompt too large/i,
+      /compaction.?fail/i,
+      /context.?window.?too small/i,
+      /maximum context length/i,
+      /token limit/i,
+    ],
+  },
+  {
+    type: "RATE_LIMITED",
+    patterns: [
+      /rate.?limit/i,
+      /too many requests/i,
+      /\b429\b/,
+      /resource.?exhausted/i,
+      /quota.?exceeded/i,
+      /throttl/i,
+    ],
+  },
+  {
+    type: "TOOL_ERROR",
+    patterns: [/tool.+(?:fail|error)/i, /(?:fail|error).+tool/i, /tool execution/i],
+  },
+];
+
+function classifyError(text: string): TaskErrorType {
+  for (const { type, patterns } of ERROR_PATTERNS) {
+    for (const re of patterns) {
+      if (re.test(text)) return type;
+    }
+  }
+  return "LLM_ERROR";
+}
+
+// ============================================================================
+// Task progress tracking (buffered NAS writes)
+// ============================================================================
+
+const _progressBuffers = new Map<
+  string,
+  { entries: ProgressEntry[]; phase: string; flushTimer: ReturnType<typeof setTimeout> | null }
+>();
+
+const PROGRESS_FLUSH_INTERVAL_MS = 5_000;
+
+function _flushProgress(cfg: ChatroomConfig, taskId: string): void {
+  const buf = _progressBuffers.get(taskId);
+  if (!buf || buf.entries.length === 0) return;
+
+  const task = readTaskRecord(cfg, taskId);
+  if (!task) return;
+
+  const existing = task.progress_log ?? [];
+  const merged = [...existing, ...buf.entries];
+  updateTaskRecord(cfg, taskId, {
+    progress_log: merged,
+    current_phase: buf.phase,
+  } as Partial<TaskRecord>);
+
+  buf.entries = [];
+}
+
+function appendTaskProgress(
+  cfg: ChatroomConfig,
+  taskId: string,
+  entry: { phase: string; detail?: string },
+): void {
+  let buf = _progressBuffers.get(taskId);
+  if (!buf) {
+    buf = { entries: [], phase: entry.phase, flushTimer: null };
+    _progressBuffers.set(taskId, buf);
+  }
+  buf.entries.push({ timestamp: nowISO(), ...entry });
+  buf.phase = entry.phase;
+
+  if (!buf.flushTimer) {
+    buf.flushTimer = setTimeout(() => {
+      _flushProgress(cfg, taskId);
+      buf!.flushTimer = null;
+    }, PROGRESS_FLUSH_INTERVAL_MS);
+  }
+}
+
+function finalizeTaskProgress(cfg: ChatroomConfig, taskId: string): void {
+  const buf = _progressBuffers.get(taskId);
+  if (buf) {
+    if (buf.flushTimer) clearTimeout(buf.flushTimer);
+    _flushProgress(cfg, taskId);
+    _progressBuffers.delete(taskId);
+  }
+}
+
+// ============================================================================
+// Task Parking — suspend long-running tasks without holding LLM sessions
+// ============================================================================
+
+function parkedTasksDir(cfg: ChatroomConfig): string {
+  return path.join(chatroomRoot(cfg), "parked_tasks");
+}
+
+function writeParkedTask(cfg: ChatroomConfig, info: ParkedTaskInfo): void {
+  const dir = parkedTasksDir(cfg);
+  ensureDir(dir);
+  writeJson(path.join(dir, `${info.task_id}.json`), info);
+}
+
+function readParkedTask(cfg: ChatroomConfig, taskId: string): ParkedTaskInfo | null {
+  return readJson(path.join(parkedTasksDir(cfg), `${taskId}.json`));
+}
+
+function removeParkedTask(cfg: ChatroomConfig, taskId: string): void {
+  const filePath = path.join(parkedTasksDir(cfg), `${taskId}.json`);
+  try {
+    fs.unlinkSync(filePath);
+  } catch {
+    /* ignore */
+  }
+}
+
+function listParkedTasks(cfg: ChatroomConfig): ParkedTaskInfo[] {
+  const dir = parkedTasksDir(cfg);
+  if (!fs.existsSync(dir)) return [];
+  const results: ParkedTaskInfo[] = [];
+  for (const file of fs.readdirSync(dir)) {
+    if (!file.endsWith(".json")) continue;
+    const info = readJson(path.join(dir, file)) as ParkedTaskInfo | null;
+    if (info) results.push(info);
+  }
+  return results;
+}
+
+function checkParkCondition(
+  cfg: ChatroomConfig,
+  info: ParkedTaskInfo,
+  logger: Logger,
+): { met: boolean; result: string } {
+  try {
+    switch (info.watch_type) {
+      case "file": {
+        const filePath = info.watch_config.file_path;
+        if (!filePath) return { met: false, result: "No file_path configured" };
+        if (fs.existsSync(filePath)) {
+          const stat = fs.statSync(filePath);
+          return {
+            met: true,
+            result: `File appeared: ${filePath} (${stat.size} bytes, modified ${stat.mtime.toISOString()})`,
+          };
+        }
+        return { met: false, result: `Waiting for file: ${filePath}` };
+      }
+      case "shell": {
+        const command = info.watch_config.command;
+        if (!command) return { met: false, result: "No command configured" };
+        const { execSync } = require("child_process");
+        try {
+          const output = execSync(command, {
+            timeout: 30_000,
+            encoding: "utf-8",
+            stdio: ["pipe", "pipe", "pipe"],
+          });
+          return { met: true, result: `Command succeeded:\n${(output as string).slice(0, 2000)}` };
+        } catch (err: any) {
+          return {
+            met: false,
+            result: `Command still failing: exit ${err.status ?? "unknown"}`,
+          };
+        }
+      }
+      case "poll_url": {
+        // Synchronous HTTP check via child_process curl
+        const url = info.watch_config.url;
+        if (!url) return { met: false, result: "No url configured" };
+        const expectedStatus = info.watch_config.expected_status ?? 200;
+        const { execSync } = require("child_process");
+        try {
+          const output = execSync(
+            `curl -s -o /dev/null -w "%{http_code}" --max-time 10 ${JSON.stringify(url)}`,
+            { encoding: "utf-8", timeout: 15_000, stdio: ["pipe", "pipe", "pipe"] },
+          );
+          const statusCode = parseInt((output as string).trim(), 10);
+          if (statusCode === expectedStatus) {
+            return { met: true, result: `URL returned ${statusCode} (expected ${expectedStatus})` };
+          }
+          return {
+            met: false,
+            result: `URL returned ${statusCode}, waiting for ${expectedStatus}`,
+          };
+        } catch {
+          return { met: false, result: `URL unreachable` };
+        }
+      }
+      case "permission": {
+        const permId = info.watch_config.permission_id;
+        if (!permId) return { met: false, result: "No permission_id configured" };
+        const permFile = path.join(permissionsDir(cfg), `${permId}.json`);
+        const perm = readJson(permFile) as PermissionRecord | null;
+        if (!perm) return { met: false, result: "Permission record not found" };
+        if (perm.status === "approved" || perm.status === "allowlisted") {
+          return {
+            met: true,
+            result: `Permission ${perm.status} by ${perm.decided_by ?? "admin"}`,
+          };
+        }
+        if (perm.status === "rejected") {
+          return {
+            met: true,
+            result: `Permission REJECTED by ${perm.decided_by ?? "admin"}: ${perm.decision_reason ?? "no reason given"}`,
+          };
+        }
+        return { met: false, result: `Waiting for human approval (${perm.status})` };
+      }
+      default:
+        return { met: false, result: `Unknown watch_type: ${info.watch_type}` };
+    }
+  } catch (err) {
+    logger.error(`Park condition check failed for ${info.task_id}: ${err}`);
+    return { met: false, result: `Check error: ${err}` };
+  }
+}
+
+function monitorParkedTasks(cfg: ChatroomConfig, runtime: any, config: any, logger: Logger): void {
+  const parked = listParkedTasks(cfg);
+  if (parked.length === 0) return;
+
+  const now = Date.now();
+
+  for (const info of parked) {
+    if (info.agent_id !== cfg.agentId) continue;
+
+    const parkedAt = new Date(info.parked_at).getTime();
+    const elapsed = now - parkedAt;
+
+    if (elapsed > info.max_wait_ms) {
+      logger.warn(`Parked task ${info.task_id} exceeded max wait (${info.max_wait_ms}ms)`);
+      removeParkedTask(cfg, info.task_id);
+      updateTaskRecord(cfg, info.task_id, {
+        status: "FAILED",
+        completed_at: nowISO(),
+        error_type: "LLM_ERROR",
+        error_detail: `Parked task timed out after ${Math.round(elapsed / 60000)} minutes`,
+        current_phase: "park_timeout",
+      } as Partial<TaskRecord>);
+      sendMessageToNAS(
+        cfg,
+        info.channel_id,
+        `[SYSTEM] Parked task ${info.task_id} timed out — waited ${Math.round(elapsed / 60000)}min for condition`,
+        "SYSTEM",
+        [],
+      );
+      continue;
+    }
+
+    const lastPoll = info.last_poll_at ? new Date(info.last_poll_at).getTime() : 0;
+    if (now - lastPoll < info.poll_interval_ms) continue;
+
+    info.last_poll_at = nowISO();
+    info.poll_count++;
+    writeParkedTask(cfg, info);
+
+    const { met, result } = checkParkCondition(cfg, info, logger);
+    appendTaskProgress(cfg, info.task_id, {
+      phase: "parked_poll",
+      detail: `[poll #${info.poll_count}] ${result.slice(0, 200)}`,
+    });
+
+    if (met) {
+      logger.info(`Parked task ${info.task_id} condition met: ${result.slice(0, 100)}`);
+      removeParkedTask(cfg, info.task_id);
+
+      // Handle permission rejection: fail the task instead of resuming
+      if (info.watch_type === "permission" && result.includes("REJECTED")) {
+        updateTaskRecord(cfg, info.task_id, {
+          status: "FAILED",
+          completed_at: nowISO(),
+          error_detail: `Permission denied: ${result}`,
+          current_phase: "permission_rejected",
+        } as Partial<TaskRecord>);
+
+        sendMessageToNAS(
+          cfg,
+          info.channel_id,
+          `[SYSTEM] Task ${info.task_id} — permission was denied by admin. The requested operation will not be executed.\n\nRejection: ${result}`,
+          "SYSTEM",
+          [],
+          undefined,
+          { task_id: info.task_id },
+        );
+
+        resetAgentStatus(cfg, info.agent_id, logger);
+        logger.info(`Task ${info.task_id} failed due to permission rejection`);
+        continue;
+      }
+
+      updateTaskRecord(cfg, info.task_id, {
+        status: "PROCESSING",
+        current_phase: "resuming_from_park",
+      } as Partial<TaskRecord>);
+
+      const isPermissionResume = info.watch_type === "permission";
+      const resumeInstruction = isPermissionResume
+        ? [
+            `[TASK RESUMED — PERMISSION GRANTED]`,
+            `task_id: ${info.task_id}`,
+            `original_instruction: ${info.original_instruction}`,
+            ``,
+            `Your previously requested sensitive operation has been APPROVED by the admin.`,
+            `${result}`,
+            ``,
+            `You may now proceed with the operation. Resume instructions:`,
+            info.resume_prompt,
+            ``,
+            `Continue processing this task. Save outputs with chatroom_save_asset(task_id="${info.task_id}").`,
+            `Your final text response will be delivered as the task result.`,
+          ].join("\n")
+        : [
+            `[TASK RESUMED FROM PARK]`,
+            `task_id: ${info.task_id}`,
+            `original_instruction: ${info.original_instruction}`,
+            ``,
+            `The long-running operation has completed. Here is the result:`,
+            result,
+            ``,
+            `Resume instructions from the agent:`,
+            info.resume_prompt,
+            ``,
+            `Continue processing this task. Save outputs with chatroom_save_asset(task_id="${info.task_id}").`,
+            `Your final text response will be delivered as the task result.`,
+          ].join("\n");
+
+      const syntheticMsg: InboxMessage = {
+        message_id: `resume_${info.task_id}_${randomUUID()}`,
+        timestamp: nowISO(),
+        channel_id: info.channel_id,
+        from: "system",
+        content: { text: resumeInstruction, mentions: [info.agent_id] },
+        type: "TASK_DISPATCH",
+        metadata: {
+          task_id: info.task_id,
+          output_dir: taskAssetsDir(cfg, info.agent_id, info.task_id),
+        },
+        seq: 0,
+      };
+
+      autoDispatchForTask(cfg, syntheticMsg, info.task_id, runtime, config, logger);
+    }
+  }
+}
+
+// ============================================================================
+// Sensitivity screening — programmatic pre-filter for the orchestrator
+// ============================================================================
+
+const SENSITIVE_PATTERNS: Array<{ re: RegExp; type: string; label: string }> = [
+  { re: /\brm\s+(-[a-zA-Z]*\s+)*\//, type: "shell", label: "rm with absolute path" },
+  { re: /\bsudo\b/, type: "shell", label: "sudo command" },
+  { re: /\bchmod\b/, type: "system", label: "permission change" },
+  { re: /\bchown\b/, type: "system", label: "ownership change" },
+  { re: /\/etc\//, type: "read", label: "system config access" },
+  { re: /\/usr\/(?:local|bin|sbin)\//, type: "write", label: "system directory write" },
+  { re: /\.env\b/, type: "read", label: ".env file access" },
+  {
+    re: /(?:password|secret|credential|api_key|private_key)\s*[:=]/i,
+    type: "read",
+    label: "credential handling",
+  },
+  {
+    re: /\bcurl\b.*(?:-d\b|-X\s*(?:POST|PUT|DELETE))/i,
+    type: "network",
+    label: "network mutation",
+  },
+  { re: /\bwget\b/, type: "network", label: "network download" },
+  { re: /\bsystemctl\b|\bservice\s+/, type: "system", label: "system service operation" },
+  { re: /\bkill\b|\bkillall\b/, type: "system", label: "process termination" },
+  { re: /\biptables\b|\bufw\b/, type: "system", label: "firewall modification" },
+  {
+    re: /\bdocker\s+(?:rm|rmi|stop|kill|exec)\b/,
+    type: "system",
+    label: "docker destructive operation",
+  },
+];
+
+function sensitivityPreFilter(
+  text: string,
+): { hit: boolean; type: string; label: string; detail: string } | null {
+  for (const { re, type, label } of SENSITIVE_PATTERNS) {
+    const match = text.match(re);
+    if (match) {
+      // Extract the surrounding context for the matched operation
+      const idx = text.indexOf(match[0]);
+      const start = Math.max(0, idx - 20);
+      const end = Math.min(text.length, idx + match[0].length + 80);
+      const detail = text.slice(start, end).trim();
+      return { hit: true, type, label, detail };
+    }
+  }
+  return null;
+}
+
+// ============================================================================
 // Daemon message handlers — route by message type
 // ============================================================================
 
@@ -612,6 +1334,8 @@ function handleIncomingTask(
     logger.warn(`Task ${taskId} not found on NAS, creating local record`);
     const dir = tasksDir(cfg);
     ensureDir(dir);
+    const metaTimeout =
+      typeof msg.metadata?.task_timeout_ms === "number" ? msg.metadata.task_timeout_ms : undefined;
     const synthetic: TaskRecord = {
       task_id: taskId,
       from: msg.from,
@@ -628,7 +1352,7 @@ function handleIncomingTask(
       retries: 0,
       max_retries: 3,
       ack_timeout_ms: 30_000,
-      task_timeout_ms: 600_000,
+      task_timeout_ms: metaTimeout ?? 3_600_000,
     };
     writeJson(path.join(dir, `${taskId}.json`), synthetic);
   }
@@ -636,7 +1360,13 @@ function handleIncomingTask(
   const currentTask = readTaskRecord(cfg, taskId)!;
   sendSystemAck(cfg, currentTask, logger);
 
-  updateTaskRecord(cfg, taskId, { status: "PROCESSING", started_at: nowISO() });
+  updateTaskRecord(cfg, taskId, {
+    status: "PROCESSING",
+    started_at: nowISO(),
+    current_phase: "processing",
+    error_type: null,
+    error_detail: null,
+  } as Partial<TaskRecord>);
   setAgentWorking(cfg, cfg.agentId, taskId, logger);
   logger.info(`Processing task ${taskId} from ${msg.from}: "${msg.content.text.slice(0, 80)}..."`);
 
@@ -650,8 +1380,12 @@ function handleTaskAck(cfg: ChatroomConfig, msg: InboxMessage, logger: Logger): 
   const task = readTaskRecord(cfg, taskId);
   if (!task) return;
 
-  if (task.status === "DISPATCHED" || task.status === "TIMEOUT") {
-    updateTaskRecord(cfg, taskId, { status: "ACKED", acked_at: nowISO() });
+  if (task.status === "DISPATCHED" || task.status === "TIMEOUT" || task.status === "RETRYING") {
+    updateTaskRecord(cfg, taskId, {
+      status: "ACKED",
+      acked_at: nowISO(),
+      current_phase: "acked",
+    } as Partial<TaskRecord>);
     logger.info(`Task ${taskId} ACK received from ${msg.from}`);
   }
 }
@@ -664,25 +1398,83 @@ function handleTaskResult(cfg: ChatroomConfig, msg: InboxMessage, logger: Logger
   if (!task) return;
 
   const resultStatus = (msg.metadata?.status as TaskStatus) || "DONE";
-  updateTaskRecord(cfg, taskId, {
+  const patch: Partial<TaskRecord> = {
     status: resultStatus,
     completed_at: nowISO(),
     result_summary: msg.content.text.slice(0, 500),
     asset_paths: msg.metadata?.asset_paths ?? [],
-  });
-  logger.info(`Task ${taskId} result received from ${msg.from} (${resultStatus})`);
+  };
+  if (msg.metadata?.error_type) {
+    patch.error_type = msg.metadata.error_type as TaskErrorType;
+    patch.error_detail = msg.content.text.slice(0, 2000);
+  }
+  patch.current_phase = resultStatus === "DONE" ? "completed" : "failed";
+  updateTaskRecord(cfg, taskId, patch);
+  logger.info(
+    `Task ${taskId} result received from ${msg.from} (${resultStatus}${patch.error_type ? ` [${patch.error_type}]` : ""})`,
+  );
 }
 
 // ============================================================================
 // ACK timeout monitoring
 // ============================================================================
 
+const RATE_LIMIT_RETRY_DELAY_MS = 60_000;
+
 function monitorPendingTasks(cfg: ChatroomConfig, logger: Logger): void {
-  const pending = listTasksByStatus(cfg, "DISPATCHED", "TIMEOUT");
+  const pending = listTasksByStatus(cfg, "DISPATCHED", "TIMEOUT", "RETRYING");
   const now = Date.now();
 
   for (const task of pending) {
     if (task.from !== cfg.agentId) continue;
+
+    // RETRYING tasks wait for the backoff period, then re-dispatch
+    if (task.status === "RETRYING") {
+      const completedAt = new Date(task.completed_at ?? task.dispatched_at).getTime();
+      if (now - completedAt < RATE_LIMIT_RETRY_DELAY_MS) continue;
+
+      if (task.retries >= task.max_retries) {
+        updateTaskRecord(cfg, task.task_id, { status: "ABANDONED", completed_at: nowISO() });
+        sendMessageToNAS(
+          cfg,
+          task.channel_id,
+          `[SYSTEM] Task ${task.task_id} abandoned — rate limit retries exhausted (${task.max_retries} attempts)`,
+          "SYSTEM",
+          [],
+        );
+        logger.warn(`Task ${task.task_id} ABANDONED after ${task.max_retries} rate-limit retries`);
+        continue;
+      }
+
+      updateTaskRecord(cfg, task.task_id, {
+        status: "DISPATCHED",
+        retries: task.retries + 1,
+        dispatched_at: nowISO(),
+        error_type: null,
+        error_detail: null,
+        completed_at: null,
+        current_phase: "retrying",
+      } as Partial<TaskRecord>);
+
+      const root = chatroomRoot(cfg);
+      const inboxDir = path.join(root, "inbox", task.to);
+      ensureDir(inboxDir);
+      const notif = {
+        notification_id: randomUUID(),
+        timestamp: nowISO(),
+        channel_id: task.channel_id,
+        message_seq: 0,
+        from: cfg.agentId,
+        preview: `[RATE-LIMIT RETRY ${task.retries + 1}/${task.max_retries}] ${task.instruction.slice(0, 80)}`,
+        priority: "urgent",
+        retry_for_task: task.task_id,
+      };
+      writeJson(path.join(inboxDir, `retry_${task.task_id}_${notif.notification_id}.json`), notif);
+      logger.info(
+        `Task ${task.task_id} rate-limit retry ${task.retries + 1}/${task.max_retries} → ${task.to}`,
+      );
+      continue;
+    }
 
     const dispatchedAt = new Date(task.dispatched_at).getTime();
     const elapsed = now - dispatchedAt;
@@ -728,12 +1520,19 @@ function monitorPendingTasks(cfg: ChatroomConfig, logger: Logger): void {
     }
   }
 
+  // Check PROCESSING tasks for timeouts
   const processing = listTasksByStatus(cfg, "ACKED", "PROCESSING");
   for (const task of processing) {
     if (task.from !== cfg.agentId) continue;
     const startedAt = new Date(task.started_at ?? task.acked_at ?? task.dispatched_at).getTime();
     if (now - startedAt > task.task_timeout_ms) {
-      updateTaskRecord(cfg, task.task_id, { status: "FAILED", completed_at: nowISO() });
+      updateTaskRecord(cfg, task.task_id, {
+        status: "FAILED",
+        completed_at: nowISO(),
+        error_type: "LLM_ERROR",
+        error_detail: `Task timed out after ${Math.round(task.task_timeout_ms / 60000)} minutes`,
+        current_phase: "timed_out",
+      } as Partial<TaskRecord>);
       sendMessageToNAS(
         cfg,
         task.channel_id,
@@ -743,6 +1542,46 @@ function monitorPendingTasks(cfg: ChatroomConfig, logger: Logger): void {
       );
       logger.warn(`Task ${task.task_id} TIMED OUT (${task.to})`);
     }
+  }
+
+  // React to error-typed FAILED tasks
+  const failed = listTasksByStatus(cfg, "FAILED");
+  for (const task of failed) {
+    if (task.from !== cfg.agentId) continue;
+    if (!task.error_type) continue;
+
+    if (task.error_type === "RATE_LIMITED") {
+      // Auto-retry: transition to RETRYING, the next monitor cycle will re-dispatch after delay
+      logger.info(`Task ${task.task_id} failed with RATE_LIMITED — scheduling auto-retry`);
+      updateTaskRecord(cfg, task.task_id, {
+        status: "RETRYING",
+        current_phase: "waiting_rate_limit",
+      } as Partial<TaskRecord>);
+      continue;
+    }
+
+    if (task.error_type === "CONTEXT_OVERFLOW") {
+      // Notify orchestrator via system message so it can decide (simplify & re-dispatch or abort)
+      const sysMsg =
+        `[SYSTEM] Task ${task.task_id} failed: CONTEXT_OVERFLOW.\n` +
+        `Target: ${task.to} | Instruction: "${task.instruction.slice(0, 100)}"\n` +
+        `The instruction may be too complex for the agent's context window.\n` +
+        `Options: simplify the instruction and re-dispatch, or cancel the task.`;
+      sendMessageToNAS(cfg, "general", sysMsg, "SYSTEM", [cfg.agentId]);
+      // Clear error_type so we don't notify repeatedly
+      updateTaskRecord(cfg, task.task_id, { error_type: null } as Partial<TaskRecord>);
+      logger.info(`Task ${task.task_id} CONTEXT_OVERFLOW — notified orchestrator in #general`);
+      continue;
+    }
+
+    // LLM_ERROR / TOOL_ERROR: notify orchestrator once
+    const sysMsg =
+      `[SYSTEM] Task ${task.task_id} failed: ${task.error_type}.\n` +
+      `Target: ${task.to} | Error: ${(task.error_detail ?? "unknown").slice(0, 200)}\n` +
+      `Review the error and decide whether to re-dispatch or cancel.`;
+    sendMessageToNAS(cfg, "general", sysMsg, "SYSTEM", [cfg.agentId]);
+    updateTaskRecord(cfg, task.task_id, { error_type: null } as Partial<TaskRecord>);
+    logger.info(`Task ${task.task_id} ${task.error_type} — notified orchestrator in #general`);
   }
 }
 
@@ -771,6 +1610,10 @@ function buildOrchestratorContext(cfg: ChatroomConfig, sourceChannel?: string): 
     `  #pipeline  → Pipeline status updates and progress summaries.`,
     `               Post stage progress (e.g. "Stage 1 complete, moving to Stage 2") here.`,
     `               Post final delivery summaries here when a full pipeline completes.`,
+    `  #permission → Sensitive operation approval channel (system-managed).`,
+    `               When agents encounter sensitive operations, the system posts approval`,
+    `               requests here automatically. Human admins approve/reject via Web UI.`,
+    `               Do NOT manually send messages to #permission.`,
     `  dm_{agent} → Private task channels between you and a specific agent.`,
     `               Task dispatch and result delivery happen here automatically via the protocol.`,
     `               Do NOT manually send messages to DM channels — the system handles it.`,
@@ -812,12 +1655,23 @@ function buildOrchestratorContext(cfg: ChatroomConfig, sourceChannel?: string): 
   lines.push(`  To save a file without sending a message: use chatroom_save_asset.`);
   lines.push(``);
 
-  const activeTasks = listTasksByStatus(cfg, "DISPATCHED", "ACKED", "PROCESSING");
+  const activeTasks = listTasksByStatus(
+    cfg,
+    "DISPATCHED",
+    "ACKED",
+    "PROCESSING",
+    "RETRYING",
+    "PARKED",
+  );
   if (activeTasks.length > 0) {
     lines.push(`═══ Active Tasks ═══`);
     for (const t of activeTasks) {
+      const phase = t.current_phase ? ` (${t.current_phase})` : "";
+      const errInfo = t.error_type ? ` [ERROR: ${t.error_type}]` : "";
+      const permNote =
+        t.current_phase === "awaiting_permission" ? " ⏳ AWAITING ADMIN APPROVAL" : "";
       lines.push(
-        `  - [${t.status}] ${t.task_id.slice(0, 8)}... → ${t.to}: "${t.instruction.slice(0, 60)}"`,
+        `  - [${t.status}${phase}${errInfo}${permNote}] ${t.task_id.slice(0, 8)}... → ${t.to}: "${t.instruction.slice(0, 60)}"`,
       );
     }
     lines.push(``);
@@ -845,6 +1699,17 @@ function buildWorkerContext(cfg: ChatroomConfig, sourceChannel?: string): string
     `  3. NEVER dispatch tasks to other agents. Only the orchestrator does that.`,
     `  4. ONLY communicate in your DM channel: #${myDM}.`,
     `  5. Focus entirely on completing the assigned task.`,
+    `  6. BEFORE executing sensitive operations, use chatroom_request_permission.`,
+    ``,
+    `═══ SENSITIVE OPERATIONS (require permission) ═══`,
+    `  You MUST call chatroom_request_permission BEFORE any of these:`,
+    `  - Shell commands that modify files outside the workspace or project directory`,
+    `  - Commands using sudo, rm -rf on system paths, chmod, chown`,
+    `  - Reading or writing .env, credentials, API keys, secrets`,
+    `  - System service operations (systemctl, docker rm/stop, kill)`,
+    `  - Network requests that modify external state (POST/PUT/DELETE to APIs)`,
+    `  If the operation is allowlisted, it will auto-approve instantly.`,
+    `  Otherwise your session will pause until an admin decides.`,
     ``,
     `═══ File System (NAS) ═══`,
     `  Your output dir: ${myAssets}`,
@@ -995,12 +1860,29 @@ async function autoDispatchForTask(
     `   For text files: chatroom_save_asset(filename="report.md", content="...", task_id="${taskId}")`,
     `2. To share files visually (so others can see images/download files), use chatroom_send_file:`,
     `   chatroom_send_file(channel_id="${msg.channel_id}", filename="output.png", content="<base64>", encoding="base64", task_id="${taskId}")`,
-    `3. Your final TEXT RESPONSE is your task result.`,
+    `3. REPORT PROGRESS at significant milestones using chatroom_task_progress:`,
+    `   chatroom_task_progress(task_id="${taskId}", phase="analyzing", detail="Reading the requirements")`,
+    `   chatroom_task_progress(task_id="${taskId}", phase="generating", detail="Creating output")`,
+    `   This keeps the orchestrator and dashboard informed of your progress.`,
+    `4. Your final TEXT RESPONSE is your task result.`,
     `   The system AUTOMATICALLY delivers it as a RESULT_REPORT to the orchestrator.`,
-    `4. DO NOT send results via Lark, Feishu, or any other messaging channel.`,
+    `5. For LONG-RUNNING OPERATIONS (builds, uploads, deployments >1min):`,
+    `   Use chatroom_task_park to suspend your session while waiting.`,
+    `   This saves tokens and prevents context overflow. A new session resumes when done.`,
+    `   Example: chatroom_task_park(task_id="${taskId}", watch_type="file", file_path="/output/build.zip",`,
+    `     resume_prompt="Build complete. Upload the zip and report results.", max_wait_minutes=30)`,
+    `6. SENSITIVE OPERATIONS require permission. BEFORE executing any of these, call chatroom_request_permission:`,
+    `   - Shell commands modifying system dirs (outside workspace), sudo, rm -rf on system paths`,
+    `   - Reading/writing .env, credentials, API keys, secrets`,
+    `   - System operations (systemctl, docker rm/stop, chmod, chown, kill)`,
+    `   - Network mutations (POST/PUT/DELETE to external APIs)`,
+    `   Example: chatroom_request_permission(task_id="${taskId}", operation_type="shell",`,
+    `     operation_detail="rm -rf /usr/local/old-sdk", reason="Need to remove old SDK before installing new one",`,
+    `     resume_prompt="Old SDK removed. Install the new SDK and continue.")`,
+    `7. DO NOT send results via Lark, Feishu, or any other messaging channel.`,
     `   DO NOT call feishu tools, reply tools, or any messaging/notification tools.`,
     `   DO NOT attempt to notify anyone manually — the system handles ALL delivery.`,
-    `5. Mention produced filenames in your text response so the orchestrator knows what was created.`,
+    `8. Mention produced filenames in your text response so the orchestrator knows what was created.`,
   ].join("\n");
 
   const ctxPayload = runtime.channel.reply.finalizeInboundContext({
@@ -1027,13 +1909,47 @@ async function autoDispatchForTask(
     agentId: route.agentId,
   });
 
+  let taskCompleted = false;
+
+  appendTaskProgress(chatroomCfg, taskId, { phase: "llm_started", detail: "Dispatching to LLM" });
+
   const dispatcherOptions = {
     responsePrefix: prefixContext.responsePrefix,
     responsePrefixContextProvider: prefixContext.responsePrefixContextProvider,
-    deliver: async (payload: ReplyPayload) => {
+    deliver: async (payload: ReplyPayload, info?: { kind: string }) => {
       const text = payload.text ?? "";
       if (!text.trim()) return;
+
+      const kind = info?.kind ?? "final";
+
+      if (kind === "tool") {
+        appendTaskProgress(chatroomCfg, taskId, {
+          phase: "tool_executed",
+          detail: text.slice(0, 300),
+        });
+        return;
+      }
+
+      if (kind === "block") {
+        appendTaskProgress(chatroomCfg, taskId, {
+          phase: "generating",
+          detail: text.slice(0, 200),
+        });
+        return;
+      }
+
+      // kind === "final" — complete the task
+      if (taskCompleted) return;
+      taskCompleted = true;
+
       try {
+        if (payload.isError) {
+          const errType = classifyError(text);
+          logger.warn(`Task ${taskId} LLM error [${errType}]: ${text.slice(0, 150)}`);
+          sendTaskResult(chatroomCfg, taskId, text, "FAILED", logger, [], errType);
+          return;
+        }
+
         const producedFiles = scanOutputDir(outputDir as string);
         sendTaskResult(chatroomCfg, taskId, text, "DONE", logger, producedFiles);
       } catch (err) {
@@ -1041,16 +1957,28 @@ async function autoDispatchForTask(
       }
     },
     onError: (err: any, info: any) => {
-      logger.error(`Task dispatch error for ${taskId} (${info?.kind}): ${err}`);
+      if (taskCompleted) return;
+      taskCompleted = true;
+      const errText = `Task processing failed: ${err}`;
+      const errType = classifyError(String(err));
+      logger.error(`Task dispatch error for ${taskId} (${info?.kind}) [${errType}]: ${err}`);
       try {
-        sendTaskResult(chatroomCfg, taskId, `Task processing failed: ${err}`, "FAILED", logger);
+        sendTaskResult(chatroomCfg, taskId, errText, "FAILED", logger, [], errType);
       } catch {
         /* ignore */
       }
     },
   };
 
-  logger.info(`Dispatching task ${taskId} to LLM`);
+  const task = readTaskRecord(chatroomCfg, taskId);
+  const taskTimeoutMs = task?.task_timeout_ms;
+  const agentTimeoutMs =
+    taskTimeoutMs && taskTimeoutMs > 600_000 ? Math.min(taskTimeoutMs, 3_600_000) : undefined;
+
+  logger.info(
+    `Dispatching task ${taskId} to LLM` +
+      (agentTimeoutMs ? ` (extended timeout: ${Math.round(agentTimeoutMs / 60000)}min)` : ""),
+  );
 
   await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
     ctx: ctxPayload,
@@ -1059,6 +1987,7 @@ async function autoDispatchForTask(
     replyOptions: {
       onModelSelected: prefixContext.onModelSelected,
       toolsDeny: ["message", "feishu_*", "lark_*"],
+      ...(agentTimeoutMs ? { agentTimeoutMs } : {}),
     },
   });
 }
@@ -1142,6 +2071,13 @@ const agentChatroomPlugin = {
                   "Set higher for long-running tasks (e.g. 120 for publishing/deployment).",
               }),
             ),
+            long_running: Type.Optional(
+              Type.Boolean({
+                description:
+                  "Mark as long-running task (builds, deploys, uploads). " +
+                  "The agent will be advised to use chatroom_task_park for waiting periods.",
+              }),
+            ),
           }),
           async execute(_toolCallId, params) {
             try {
@@ -1149,9 +2085,18 @@ const agentChatroomPlugin = {
                 target: string;
                 instruction: string;
                 timeout_minutes?: number;
+                long_running?: boolean;
               };
               const timeoutMs = (p.timeout_minutes ?? 60) * 60_000;
-              const task = dispatchTask(cfg, p.target, p.instruction, logger, {
+              let instruction = p.instruction;
+              if (p.long_running) {
+                instruction +=
+                  "\n\n[LONG-RUNNING TASK] This task may involve operations that take minutes " +
+                  "(builds, uploads, deployments). Use chatroom_task_park to suspend your session " +
+                  "while waiting for long operations instead of polling or sleeping. This prevents " +
+                  "context overflow and saves tokens.";
+              }
+              const task = dispatchTask(cfg, p.target, instruction, logger, {
                 taskTimeoutMs: timeoutMs,
               });
               return {
@@ -1163,6 +2108,7 @@ const agentChatroomPlugin = {
                       `  task_id: ${task.task_id}\n` +
                       `  channel: #${task.channel_id}\n` +
                       `  timeout: ${p.timeout_minutes ?? 60} minutes\n` +
+                      `  long_running: ${p.long_running ?? false}\n` +
                       `  status: DISPATCHED (awaiting ACK)\n` +
                       `The system will auto-retry if ${p.target} doesn't respond.`,
                   },
@@ -1643,13 +2589,375 @@ const agentChatroomPlugin = {
       { names: ["chatroom_check_inbox"] },
     );
 
+    // ── Tool: report task progress (available to all agents) ────────────────
+
+    api.registerTool(
+      {
+        name: "chatroom_task_progress",
+        label: "Chatroom: Report Task Progress",
+        description:
+          "Report progress on an active task. Use this to keep the orchestrator informed of " +
+          "what you are currently doing.\n\n" +
+          "Examples:\n" +
+          '  chatroom_task_progress(task_id="abc...", phase="generating_image", detail="Creating base composition")\n' +
+          '  chatroom_task_progress(task_id="abc...", phase="uploading", detail="Pushing to NAS")\n\n' +
+          "Call this at significant milestones so the orchestrator and dashboard can track your progress.",
+        parameters: Type.Object({
+          task_id: Type.String({ description: "The task ID you are working on" }),
+          phase: Type.String({
+            description:
+              "Short phase label (e.g. 'analyzing', 'generating', 'uploading', 'finalizing')",
+          }),
+          detail: Type.Optional(
+            Type.String({ description: "Optional details about what is happening" }),
+          ),
+        }),
+        async execute(_toolCallId, params) {
+          try {
+            const p = params as { task_id: string; phase: string; detail?: string };
+            appendTaskProgress(cfg, p.task_id, {
+              phase: p.phase,
+              detail: p.detail,
+            });
+            updateTaskRecord(cfg, p.task_id, { current_phase: p.phase } as Partial<TaskRecord>);
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `Progress recorded: [${p.phase}]${p.detail ? ` ${p.detail}` : ""}`,
+                },
+              ],
+              details: { task_id: p.task_id, phase: p.phase },
+            };
+          } catch (err) {
+            return {
+              content: [{ type: "text" as const, text: `Error: ${err}` }],
+              details: undefined,
+            };
+          }
+        },
+      },
+      { names: ["chatroom_task_progress"] },
+    );
+
+    // ── Tool: park a task for long-running operations ───────────────────────
+
+    api.registerTool(
+      {
+        name: "chatroom_task_park",
+        label: "Chatroom: Park Task (Long-Running)",
+        description:
+          "Park a task to wait for a long-running operation WITHOUT holding the LLM session.\n" +
+          "Use this when you need to wait for something that takes minutes or longer:\n" +
+          "  - A build/compile process to finish\n" +
+          "  - A file to appear (e.g. build output, download)\n" +
+          "  - An HTTP endpoint to become available\n\n" +
+          "HOW IT WORKS:\n" +
+          "  1. You call this tool with what to watch for and what to do when it's ready\n" +
+          "  2. Your LLM session ENDS immediately (saving tokens and context)\n" +
+          "  3. A lightweight system monitor checks the condition periodically\n" +
+          "  4. When the condition is met, a NEW LLM session starts with your resume_prompt\n\n" +
+          "IMPORTANT: After calling this tool, your response will be your FINAL output.\n" +
+          "Put all continuation logic in resume_prompt.\n\n" +
+          "Watch types:\n" +
+          '  - "shell": Run a command; condition met when it exits 0\n' +
+          '  - "file": Wait for a file to appear at a path\n' +
+          '  - "poll_url": Poll a URL; condition met when it returns expected status code\n\n' +
+          "Example:\n" +
+          '  chatroom_task_park(task_id="abc", watch_type="shell",\n' +
+          '    command="test -f /output/build.zip && echo done",\n' +
+          '    resume_prompt="Build finished. Upload build.zip to NAS and report.",\n' +
+          "    poll_interval_ms=30000, max_wait_minutes=30)",
+        parameters: Type.Object({
+          task_id: Type.String({ description: "The task ID being parked" }),
+          watch_type: Type.String({
+            description: 'What to watch: "shell", "file", or "poll_url"',
+          }),
+          command: Type.Optional(
+            Type.String({
+              description: 'For watch_type="shell": the command to run (success = exit 0)',
+            }),
+          ),
+          file_path: Type.Optional(
+            Type.String({
+              description: 'For watch_type="file": absolute path to watch for',
+            }),
+          ),
+          url: Type.Optional(
+            Type.String({
+              description: 'For watch_type="poll_url": the URL to poll',
+            }),
+          ),
+          expected_status: Type.Optional(
+            Type.Number({
+              description: 'For watch_type="poll_url": expected HTTP status (default 200)',
+            }),
+          ),
+          resume_prompt: Type.String({
+            description:
+              "Instructions for the NEW LLM session when the condition is met. " +
+              "Include everything the agent needs to continue (what to do next, file paths, etc.)",
+          }),
+          poll_interval_ms: Type.Optional(
+            Type.Number({
+              description: "How often to check the condition in ms (default 30000 = 30s)",
+            }),
+          ),
+          max_wait_minutes: Type.Optional(
+            Type.Number({
+              description: "Maximum time to wait in minutes (default 30, max 120)",
+            }),
+          ),
+        }),
+        async execute(_toolCallId, params) {
+          try {
+            const p = params as {
+              task_id: string;
+              watch_type: string;
+              command?: string;
+              file_path?: string;
+              url?: string;
+              expected_status?: number;
+              resume_prompt: string;
+              poll_interval_ms?: number;
+              max_wait_minutes?: number;
+            };
+
+            const task = readTaskRecord(cfg, p.task_id);
+            if (!task) {
+              return {
+                content: [{ type: "text" as const, text: `Task ${p.task_id} not found.` }],
+                details: undefined,
+              };
+            }
+
+            const watchType = p.watch_type as ParkWatchType;
+            if (!["shell", "file", "poll_url"].includes(watchType)) {
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: `Invalid watch_type "${p.watch_type}". Use "shell", "file", or "poll_url".`,
+                  },
+                ],
+                details: undefined,
+              };
+            }
+
+            const maxWaitMinutes = Math.min(p.max_wait_minutes ?? 30, 120);
+            const pollInterval = Math.max(p.poll_interval_ms ?? 30_000, 5_000);
+
+            const parkedInfo: ParkedTaskInfo = {
+              task_id: p.task_id,
+              agent_id: cfg.agentId,
+              channel_id: task.channel_id,
+              original_instruction: task.instruction,
+              resume_prompt: p.resume_prompt,
+              watch_type: watchType,
+              watch_config: {
+                command: p.command,
+                file_path: p.file_path,
+                url: p.url,
+                expected_status: p.expected_status,
+              },
+              poll_interval_ms: pollInterval,
+              max_wait_ms: maxWaitMinutes * 60_000,
+              parked_at: nowISO(),
+              last_poll_at: null,
+              poll_count: 0,
+            };
+
+            writeParkedTask(cfg, parkedInfo);
+
+            updateTaskRecord(cfg, p.task_id, {
+              status: "PARKED",
+              current_phase: `parked_${watchType}`,
+            } as Partial<TaskRecord>);
+            appendTaskProgress(cfg, p.task_id, {
+              phase: "parked",
+              detail: `Parked: watching ${watchType} (poll every ${pollInterval / 1000}s, max ${maxWaitMinutes}min)`,
+            });
+
+            logger.info(
+              `Task ${p.task_id} PARKED: ${watchType}, poll ${pollInterval}ms, max ${maxWaitMinutes}min`,
+            );
+
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text:
+                    `Task ${p.task_id} is now PARKED.\n` +
+                    `Watch: ${watchType} (poll every ${pollInterval / 1000}s, max wait ${maxWaitMinutes}min)\n` +
+                    `Your LLM session will end now. When the condition is met, a new session ` +
+                    `will start with your resume_prompt.\n\n` +
+                    `You can now provide a brief status message as your final response.`,
+                },
+              ],
+              details: parkedInfo,
+            };
+          } catch (err) {
+            return {
+              content: [{ type: "text" as const, text: `Error parking task: ${err}` }],
+              details: undefined,
+            };
+          }
+        },
+      },
+      { names: ["chatroom_task_park"] },
+    );
+
+    // ── Tool: request permission for sensitive operations ──────────────────
+
+    api.registerTool(
+      {
+        name: "chatroom_request_permission",
+        label: "Chatroom: Request Permission",
+        description:
+          "Request human admin approval before executing a sensitive operation.\n" +
+          "Use this BEFORE performing any of these operations:\n" +
+          "  - Shell commands that modify system directories (outside workspace)\n" +
+          "  - Reading or writing sensitive files (.env, credentials, keys)\n" +
+          "  - System-level operations (chmod, chown, systemctl, docker rm)\n" +
+          "  - Network operations that mutate external state (POST/PUT/DELETE)\n\n" +
+          "HOW IT WORKS:\n" +
+          "  1. You call this tool describing the operation you want to perform\n" +
+          "  2. If the operation is already allowlisted, it auto-approves instantly\n" +
+          "  3. Otherwise, your LLM session ENDS and the request goes to the admin\n" +
+          "  4. When approved, a NEW session starts with your resume_prompt\n" +
+          "  5. If rejected, the task is marked as failed\n\n" +
+          "IMPORTANT: After calling this tool (if not auto-approved), your next response is FINAL.",
+        parameters: Type.Object({
+          task_id: Type.String({ description: "The task ID you are working on" }),
+          operation_type: Type.String({
+            description: 'Type of operation: "shell", "write", "read", "network", or "system"',
+          }),
+          operation_detail: Type.String({
+            description:
+              "The actual command or file path (e.g. 'rm -rf /usr/local/old-sdk' or '/etc/nginx/nginx.conf')",
+          }),
+          reason: Type.String({
+            description: "Brief explanation of why this operation is needed",
+          }),
+          resume_prompt: Type.String({
+            description: "Instructions for the NEW LLM session if the operation is approved",
+          }),
+        }),
+        async execute(_toolCallId, params) {
+          try {
+            const p = params as {
+              task_id: string;
+              operation_type: string;
+              operation_detail: string;
+              reason: string;
+              resume_prompt: string;
+            };
+
+            const task = readTaskRecord(cfg, p.task_id);
+            if (!task) {
+              return {
+                content: [{ type: "text" as const, text: `Task ${p.task_id} not found.` }],
+                details: undefined,
+              };
+            }
+
+            // Check allowlist first
+            if (matchesAllowlist(cfg, p.operation_type, p.operation_detail)) {
+              logger.info(
+                `Permission auto-approved (allowlisted) for task ${p.task_id}: ${p.operation_type} ${p.operation_detail.slice(0, 60)}`,
+              );
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text:
+                      `Operation auto-approved (allowlisted). You may proceed.\n` +
+                      `  type: ${p.operation_type}\n` +
+                      `  detail: ${p.operation_detail}`,
+                  },
+                ],
+                details: { auto_approved: true },
+              };
+            }
+
+            // Create permission request
+            const permRecord = createPermissionRequest(
+              cfg,
+              p.task_id,
+              cfg.agentId,
+              task.channel_id,
+              p.operation_type,
+              p.operation_detail,
+              p.reason,
+              task.instruction,
+              p.resume_prompt,
+              logger,
+            );
+
+            // Park the task with watch_type="permission"
+            const parkedInfo: ParkedTaskInfo = {
+              task_id: p.task_id,
+              agent_id: cfg.agentId,
+              channel_id: task.channel_id,
+              original_instruction: task.instruction,
+              resume_prompt: p.resume_prompt,
+              watch_type: "permission",
+              watch_config: {
+                permission_id: permRecord.permission_id,
+              },
+              poll_interval_ms: 5_000,
+              max_wait_ms: 24 * 60 * 60_000,
+              parked_at: nowISO(),
+              last_poll_at: null,
+              poll_count: 0,
+            };
+            writeParkedTask(cfg, parkedInfo);
+
+            updateTaskRecord(cfg, p.task_id, {
+              status: "PARKED",
+              current_phase: "awaiting_permission",
+            } as Partial<TaskRecord>);
+
+            appendTaskProgress(cfg, p.task_id, {
+              phase: "awaiting_permission",
+              detail: `Permission requested: ${p.operation_type} — ${p.operation_detail.slice(0, 100)}`,
+            });
+
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text:
+                    `Permission request submitted (ID: ${permRecord.permission_id.slice(0, 8)}...).\n` +
+                    `Task is now PARKED awaiting admin approval.\n` +
+                    `  Operation: ${p.operation_type} — ${p.operation_detail}\n` +
+                    `  Reason: ${p.reason}\n\n` +
+                    `Your LLM session will end now. If approved, a new session starts with your resume_prompt.\n` +
+                    `Provide a brief status message as your final response.`,
+                },
+              ],
+              details: { permission_id: permRecord.permission_id, parked: true },
+            };
+          } catch (err) {
+            return {
+              content: [{ type: "text" as const, text: `Error requesting permission: ${err}` }],
+              details: undefined,
+            };
+          }
+        },
+      },
+      { names: ["chatroom_request_permission"] },
+    );
+
     // ── Background service ──────────────────────────────────────────────────
 
     const pollIntervalMs = (pluginCfg.pollIntervalMs as number) ?? 3000;
     const taskMonitorIntervalMs = (pluginCfg.taskMonitorIntervalMs as number) ?? 10_000;
+    const parkMonitorIntervalMs = (pluginCfg.parkMonitorIntervalMs as number) ?? 15_000;
     let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
     let pollTimer: ReturnType<typeof setInterval> | null = null;
     let taskMonitorTimer: ReturnType<typeof setInterval> | null = null;
+    let parkMonitorTimer: ReturnType<typeof setInterval> | null = null;
 
     api.registerService({
       id: "chatroom-daemon",
@@ -1674,6 +2982,18 @@ const agentChatroomPlugin = {
             const messages = pollInbox(cfg);
             for (const msg of messages) {
               try {
+                // ── System command gate: self-update bypasses DM restriction ──
+                if (isSelfUpdateCommand(msg)) {
+                  if (isSelfUpdateAuthorized(msg)) {
+                    await handleSelfUpdate(cfg, msg, logger);
+                  } else {
+                    logger.warn(
+                      `[self-update] Unauthorized update request from ${msg.from}, ignoring`,
+                    );
+                  }
+                  continue;
+                }
+
                 // ── Hard gate: workers ONLY process their own DM channel ──
                 if (cfg.role !== "orchestrator") {
                   if (msg.channel_id !== myDM) {
@@ -1693,7 +3013,31 @@ const agentChatroomPlugin = {
                     break;
                   case "RESULT_REPORT":
                     handleTaskResult(cfg, msg, logger);
-                    // Also dispatch to LLM so orchestrator can relay to human
+                    // Orchestrator: screen for sensitive operations before forwarding
+                    if (cfg.role === "orchestrator") {
+                      const screening = sensitivityPreFilter(msg.content.text);
+                      if (screening) {
+                        const taskId = msg.metadata?.task_id as string | undefined;
+                        if (taskId && !matchesAllowlist(cfg, screening.type, screening.detail)) {
+                          logger.warn(
+                            `Sensitivity screening triggered for task ${taskId}: ${screening.label}`,
+                          );
+                          createPermissionRequest(
+                            cfg,
+                            taskId,
+                            msg.from,
+                            msg.channel_id,
+                            screening.type,
+                            screening.detail,
+                            `Orchestrator screening: ${screening.label} detected in result from ${msg.from}`,
+                            "",
+                            `Review the agent's result report and decide on next steps.`,
+                            logger,
+                          );
+                          break;
+                        }
+                      }
+                    }
                     await autoDispatchMessage(cfg, msg, runtime, config, logger);
                     break;
                   default:
@@ -1719,11 +3063,21 @@ const agentChatroomPlugin = {
             }
           }, taskMonitorIntervalMs);
         }
+
+        // Park monitor — checks parked task conditions (all agents)
+        parkMonitorTimer = setInterval(() => {
+          try {
+            monitorParkedTasks(cfg, runtime, config, logger);
+          } catch {
+            /* ignore */
+          }
+        }, parkMonitorIntervalMs);
       },
       stop: async () => {
         if (heartbeatTimer) clearInterval(heartbeatTimer);
         if (pollTimer) clearInterval(pollTimer);
         if (taskMonitorTimer) clearInterval(taskMonitorTimer);
+        if (parkMonitorTimer) clearInterval(parkMonitorTimer);
         logger.info("Chatroom daemon stopped");
       },
     });
