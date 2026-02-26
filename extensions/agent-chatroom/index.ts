@@ -329,15 +329,71 @@ function pollInbox(cfg: ChatroomConfig): InboxMessage[] {
       const notif = readJson(filePath);
       if (!notif) continue;
 
-      const msgDir = path.join(root, "channels", notif.channel_id, "messages");
-      if (fs.existsSync(msgDir)) {
-        const prefix = String(notif.message_seq).padStart(6, "0");
-        const msgFiles = fs.readdirSync(msgDir).filter((f) => f.startsWith(prefix));
-        if (msgFiles.length > 0) {
-          const fullMsg = readJson(path.join(msgDir, msgFiles[0]));
-          if (fullMsg) messages.push(fullMsg);
+      let resolved = false;
+
+      // Try to read the original message from the channel
+      if (notif.message_seq && notif.message_seq > 0) {
+        const msgDir = path.join(root, "channels", notif.channel_id, "messages");
+        if (fs.existsSync(msgDir)) {
+          const prefix = String(notif.message_seq).padStart(6, "0");
+          const msgFiles = fs.readdirSync(msgDir).filter((f) => f.startsWith(prefix));
+          if (msgFiles.length > 0) {
+            const fullMsg = readJson(path.join(msgDir, msgFiles[0]));
+            if (fullMsg) {
+              messages.push(fullMsg);
+              resolved = true;
+            }
+          }
         }
       }
+
+      // Fallback: retry notifications or missing message files — construct
+      // a synthetic InboxMessage from the notification itself so it can still
+      // be routed (e.g. as a TASK_DISPATCH retry).
+      if (!resolved && notif.retry_for_task) {
+        const taskData = readJson(path.join(tasksDir(cfg), `${notif.retry_for_task}.json`));
+        if (taskData) {
+          messages.push({
+            message_id: notif.notification_id ?? randomUUID(),
+            channel_id: notif.channel_id,
+            from: notif.from ?? taskData.from,
+            type: "TASK_DISPATCH",
+            content: {
+              text: taskData.instruction ?? notif.preview ?? "",
+              mentions: [cfg.agentId],
+            },
+            timestamp: notif.timestamp ?? nowISO(),
+            seq: 0,
+            metadata: {
+              task_id: notif.retry_for_task,
+              priority: "urgent",
+              output_dir: taskData.asset_paths?.[0]
+                ? path.dirname(taskData.asset_paths[0])
+                : taskAssetsDir(cfg, cfg.agentId, notif.retry_for_task),
+              is_retry: true,
+            },
+          });
+          resolved = true;
+        }
+      }
+
+      // Fallback: construct minimal message from notification preview
+      if (!resolved && notif.preview) {
+        messages.push({
+          message_id: notif.notification_id ?? randomUUID(),
+          channel_id: notif.channel_id,
+          from: notif.from ?? "unknown",
+          type: "CHAT",
+          content: {
+            text: notif.preview,
+            mentions: notif.mentioned ? [cfg.agentId] : [],
+          },
+          timestamp: notif.timestamp ?? nowISO(),
+          seq: notif.message_seq ?? 0,
+          metadata: {},
+        });
+      }
+
       fs.unlinkSync(filePath);
     } catch {
       /* skip */
@@ -376,8 +432,8 @@ function createTaskRecord(
     asset_paths: [],
     retries: 0,
     max_retries: opts?.maxRetries ?? 3,
-    ack_timeout_ms: opts?.ackTimeoutMs ?? 30_000,
-    task_timeout_ms: opts?.taskTimeoutMs ?? 600_000,
+    ack_timeout_ms: opts?.ackTimeoutMs ?? 60_000,
+    task_timeout_ms: opts?.taskTimeoutMs ?? 3_600_000,
   };
 
   writeJson(path.join(dir, `${task.task_id}.json`), task);
@@ -469,6 +525,7 @@ function sendTaskResult(
     result_summary: resultText.slice(0, 500),
     asset_paths: assetPaths,
   });
+  resetAgentStatus(cfg, task.to, logger);
   logger.info(`Result sent for task ${taskId} (${status}) → ${task.from}`);
 }
 
@@ -503,6 +560,22 @@ function cancelTask(
   resetAgentStatus(cfg, task.to, logger);
   logger.info(`Task ${taskId} cancelled (was ${task.status}) → ${task.to}`);
   return { ...task, status: "CANCELLED", completed_at: nowISO() };
+}
+
+function setAgentWorking(
+  cfg: ChatroomConfig,
+  agentId: string,
+  taskId: string,
+  logger: Logger,
+): void {
+  const regPath = path.join(chatroomRoot(cfg), "registry", `${agentId}.json`);
+  const info = readJson(regPath);
+  if (!info) return;
+  info.status = "working";
+  info.current_task = taskId;
+  info.last_heartbeat = nowISO();
+  writeJson(regPath, info);
+  logger.info(`Agent ${agentId} status → working (task: ${taskId.slice(0, 8)})`);
 }
 
 function resetAgentStatus(cfg: ChatroomConfig, agentId: string, logger: Logger): void {
@@ -564,6 +637,7 @@ function handleIncomingTask(
   sendSystemAck(cfg, currentTask, logger);
 
   updateTaskRecord(cfg, taskId, { status: "PROCESSING", started_at: nowISO() });
+  setAgentWorking(cfg, cfg.agentId, taskId, logger);
   logger.info(`Processing task ${taskId} from ${msg.from}: "${msg.content.text.slice(0, 80)}..."`);
 
   autoDispatchForTask(cfg, msg, taskId, runtime, config, logger);
@@ -1061,11 +1135,25 @@ const agentChatroomPlugin = {
             instruction: Type.String({
               description: "What you want the agent to do — be specific and actionable",
             }),
+            timeout_minutes: Type.Optional(
+              Type.Number({
+                description:
+                  "Task timeout in minutes. Default: 60. " +
+                  "Set higher for long-running tasks (e.g. 120 for publishing/deployment).",
+              }),
+            ),
           }),
           async execute(_toolCallId, params) {
             try {
-              const p = params as { target: string; instruction: string };
-              const task = dispatchTask(cfg, p.target, p.instruction, logger);
+              const p = params as {
+                target: string;
+                instruction: string;
+                timeout_minutes?: number;
+              };
+              const timeoutMs = (p.timeout_minutes ?? 60) * 60_000;
+              const task = dispatchTask(cfg, p.target, p.instruction, logger, {
+                taskTimeoutMs: timeoutMs,
+              });
               return {
                 content: [
                   {
@@ -1074,6 +1162,7 @@ const agentChatroomPlugin = {
                       `Task dispatched to ${p.target}.\n` +
                       `  task_id: ${task.task_id}\n` +
                       `  channel: #${task.channel_id}\n` +
+                      `  timeout: ${p.timeout_minutes ?? 60} minutes\n` +
                       `  status: DISPATCHED (awaiting ACK)\n` +
                       `The system will auto-retry if ${p.target} doesn't respond.`,
                   },
