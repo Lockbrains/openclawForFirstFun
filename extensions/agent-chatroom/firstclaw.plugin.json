@@ -27,6 +27,11 @@
       "placeholder": "3000",
       "help": "How often the daemon polls the NAS inbox",
       "advanced": true
+    },
+    "repoRoot": {
+      "label": "FirstClaw Repo Root",
+      "placeholder": "/Users/me/openclaw",
+      "help": "Absolute path to the local FirstClaw git repository. Required for /system-update to work."
     }
   },
   "configSchema": {
@@ -49,6 +54,9 @@
       },
       "pollIntervalMs": {
         "type": "number"
+      },
+      "repoRoot": {
+        "type": "string"
       }
     },
     "required": ["nasRoot", "agentId"]

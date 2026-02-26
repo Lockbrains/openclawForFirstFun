@@ -2,14 +2,16 @@
  * `firstclaw register` — Register a new agent in the Agent Family chatroom.
  *
  * Usage:
- *   firstclaw register <category> <displayName> [--id <agentId>] [--nas-root <path>]
+ *   firstclaw register <category> <displayName> [--id <agentId>] [--nas-root <path>] [--repo-root <path>]
  *
  * Examples:
  *   firstclaw register art "FirstArt02"
  *   firstclaw register publish "FirstGit02" --id git02
+ *   firstclaw register dev "FirstDev01" --repo-root /home/user/openclaw
  */
 
 import type { Command } from "commander";
+import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { resolveCanonicalConfigPath } from "../config/paths.js";
@@ -44,6 +46,18 @@ function readJsonFile(filePath: string): Record<string, unknown> | null {
 
 function writeJsonFile(filePath: string, data: unknown): void {
   fs.writeFileSync(filePath, JSON.stringify(data, null, 2), "utf-8");
+}
+
+function autoDetectRepoRoot(): string | null {
+  try {
+    return execSync("git rev-parse --show-toplevel", {
+      encoding: "utf-8",
+      timeout: 5_000,
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim();
+  } catch {
+    return null;
+  }
 }
 
 function resolveNasRoot(cliOverride?: string): string | null {
@@ -93,6 +107,31 @@ function updateLocalConfig(agentId: string, nasRoot?: string): void {
     cfg.plugins.entries["agent-chatroom"].config.nasRoot = nasRoot;
   }
   cfg.plugins.entries["agent-chatroom"].enabled = true;
+}
+
+function updateRepoRoot(repoRoot: string): void {
+  const configPath = resolveCanonicalConfigPath();
+  let cfg: Record<string, any> = {};
+  try {
+    cfg = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+  } catch {
+    fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  }
+
+  if (!cfg.plugins) {
+    cfg.plugins = {};
+  }
+  if (!cfg.plugins.entries) {
+    cfg.plugins.entries = {};
+  }
+  if (!cfg.plugins.entries["agent-chatroom"]) {
+    cfg.plugins.entries["agent-chatroom"] = {};
+  }
+  if (!cfg.plugins.entries["agent-chatroom"].config) {
+    cfg.plugins.entries["agent-chatroom"].config = {};
+  }
+
+  cfg.plugins.entries["agent-chatroom"].config.repoRoot = repoRoot;
 
   writeJsonFile(configPath, cfg);
 }
@@ -100,6 +139,7 @@ function updateLocalConfig(agentId: string, nasRoot?: string): void {
 interface RegisterOptions {
   id?: string;
   nasRoot?: string;
+  repoRoot?: string;
   force?: boolean;
 }
 
@@ -255,6 +295,22 @@ function runRegister(category: string, displayName: string, opts: RegisterOption
     console.warn(`  [!] Could not update local config: ${err}`);
   }
 
+  // 6. Set repoRoot for auto-update if provided (or auto-detect)
+  const effectiveRepoRoot = opts.repoRoot ?? autoDetectRepoRoot();
+  if (effectiveRepoRoot) {
+    try {
+      updateRepoRoot(effectiveRepoRoot);
+      console.log(`  [+] Repo root: "${effectiveRepoRoot}"`);
+    } catch (err) {
+      console.warn(`  [!] Could not set repoRoot in config: ${err}`);
+    }
+  } else {
+    console.log(
+      `  [!] repoRoot not set. Auto-update will not work until you run:\n` +
+        `      firstclaw config set plugins.entries.agent-chatroom.config.repoRoot /path/to/your/firstclaw/repo`,
+    );
+  }
+
   console.log(`\nAgent "${displayName}" registered successfully.`);
   console.log(`  agent_id:  ${agentId}`);
   console.log(`  category:  ${category}`);
@@ -270,6 +326,7 @@ export function registerRegisterCli(program: Command) {
     .argument("<displayName>", 'Display name (e.g. "FirstArt02")')
     .option("--id <agentId>", "Override auto-derived agent_id")
     .option("--nas-root <path>", "NAS root path (default: from config)")
+    .option("--repo-root <path>", "Path to the local FirstClaw git repo (auto-detected if omitted)")
     .option("--force", "Re-register even if agent already exists (repairs partial registrations)")
     .action((category: string, displayName: string, opts: RegisterOptions) => {
       runRegister(category, displayName, opts);

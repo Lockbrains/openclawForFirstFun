@@ -35,6 +35,7 @@ interface ChatroomConfig {
   agentId: string;
   localDir: string;
   role: "orchestrator" | "worker";
+  repoRoot: string | null;
 }
 
 interface AgentRegistryEntry {
@@ -548,12 +549,13 @@ function resolveGitRoot(): string | null {
   }
 }
 
-function resolveProjectRoot(): string {
+function resolveProjectRoot(repoRoot?: string | null): string {
+  if (repoRoot) return repoRoot;
   return resolveGitRoot() ?? process.cwd();
 }
 
-function readProjectVersion(): string {
-  const root = resolveProjectRoot();
+function readProjectVersion(repoRoot?: string | null): string {
+  const root = resolveProjectRoot(repoRoot);
   const buildInfo = readJson(path.join(root, "dist", "build-info.json"));
   if (buildInfo?.version) return buildInfo.version;
   const pkg = readJson(path.join(root, "package.json"));
@@ -561,8 +563,8 @@ function readProjectVersion(): string {
   return "unknown";
 }
 
-function readProjectCommit(): string {
-  const root = resolveProjectRoot();
+function readProjectCommit(repoRoot?: string | null): string {
+  const root = resolveProjectRoot(repoRoot);
   const buildInfo = readJson(path.join(root, "dist", "build-info.json"));
   if (buildInfo?.commit) return String(buildInfo.commit).slice(0, 8);
   try {
@@ -578,22 +580,22 @@ function readProjectCommit(): string {
 }
 
 function writeSelfUpdateMarker(cfg: ChatroomConfig, requestedBy: string): void {
-  const markerPath = path.join(resolveProjectRoot(), SELF_UPDATE_MARKER);
+  const markerPath = path.join(resolveProjectRoot(cfg.repoRoot), SELF_UPDATE_MARKER);
   writeJson(markerPath, {
     agent_id: cfg.agentId,
-    previous_version: readProjectVersion(),
+    previous_version: readProjectVersion(cfg.repoRoot),
     requested_by: requestedBy,
     timestamp: nowISO(),
   });
 }
 
-function readAndClearSelfUpdateMarker(): {
+function readAndClearSelfUpdateMarker(repoRoot?: string | null): {
   agent_id: string;
   previous_version: string;
   requested_by: string;
   timestamp: string;
 } | null {
-  const markerPath = path.join(resolveProjectRoot(), SELF_UPDATE_MARKER);
+  const markerPath = path.join(resolveProjectRoot(repoRoot), SELF_UPDATE_MARKER);
   const data = readJson(markerPath);
   if (!data) return null;
   try {
@@ -674,8 +676,8 @@ function isSelfUpdateAuthorized(msg: InboxMessage): boolean {
 
 function reportVersionToUpgrade(cfg: ChatroomConfig, extra?: string): void {
   ensureUpgradeChannel(cfg);
-  const version = readProjectVersion();
-  const commit = readProjectCommit();
+  const version = readProjectVersion(cfg.repoRoot);
+  const commit = readProjectCommit(cfg.repoRoot);
   let text = `[${cfg.agentId}] Current version: v${version} (${commit})`;
   if (extra) text += `\n${extra}`;
   sendMessageToNAS(cfg, UPGRADE_CHANNEL_ID, text, "STATUS_UPDATE");
@@ -686,7 +688,20 @@ async function handleSelfUpdate(
   msg: InboxMessage,
   logger: Logger,
 ): Promise<void> {
-  const projectRoot = resolveProjectRoot();
+  if (!cfg.repoRoot) {
+    const errMsg =
+      `[${cfg.agentId}] Cannot perform update: repoRoot is not configured. ` +
+      `Please run: firstclaw config set plugins.entries.agent-chatroom.config.repoRoot /path/to/your/firstclaw/repo`;
+    logger.error(`[self-update] ${errMsg}`);
+    try {
+      sendMessageToNAS(cfg, UPGRADE_CHANNEL_ID, errMsg, "STATUS_UPDATE");
+    } catch {
+      /* ignore */
+    }
+    return;
+  }
+
+  const projectRoot = cfg.repoRoot;
   logger.info(
     `[self-update] Received update command from ${msg.from} in #${msg.channel_id} (root: ${projectRoot})`,
   );
@@ -2142,6 +2157,7 @@ const agentChatroomPlugin = {
       agentId,
       role,
       localDir: (pluginCfg.localDir as string) ?? "./chatroom_local",
+      repoRoot: (pluginCfg.repoRoot as string) ?? null,
     };
     ensureDir(cfg.localDir);
     ensureDir(tasksDir(cfg));
@@ -3090,10 +3106,10 @@ const agentChatroomPlugin = {
 
         // Post-update version report
         try {
-          const marker = readAndClearSelfUpdateMarker();
+          const marker = readAndClearSelfUpdateMarker(cfg.repoRoot);
           if (marker) {
-            const newVersion = readProjectVersion();
-            const commit = readProjectCommit();
+            const newVersion = readProjectVersion(cfg.repoRoot);
+            const commit = readProjectCommit(cfg.repoRoot);
             ensureUpgradeChannel(cfg);
             const prev = marker.previous_version;
             sendMessageToNAS(
