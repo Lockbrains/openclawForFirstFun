@@ -22,7 +22,7 @@
 import type { FirstClawPluginApi } from "firstclaw/plugin-sdk";
 import { Type } from "@sinclair/typebox";
 import { createReplyPrefixContext, type ReplyPayload } from "firstclaw/plugin-sdk";
-import { execSync } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -533,7 +533,6 @@ function updateHeartbeat(cfg: ChatroomConfig): void {
 // Self-update: git pull → exit(42) → run-node.mjs handles install + build + relaunch
 // ============================================================================
 
-const SELF_UPDATE_EXIT_CODE = 42;
 const UPGRADE_CHANNEL_ID = "upgrade";
 const SELF_UPDATE_MARKER = ".self-update-pending.json";
 
@@ -731,6 +730,7 @@ async function handleSelfUpdate(
   };
 
   try {
+    // ── Step 1: git pull ──
     logger.info("[self-update] Running git pull...");
     const pullOutput = execSync("git pull --ff-only", {
       cwd: projectRoot,
@@ -749,18 +749,42 @@ async function handleSelfUpdate(
       return;
     }
 
+    // ── Step 2: pause tasks ──
     const parkedCount = pauseActiveTasksForUpgrade(cfg, logger);
     const parkedNote = parkedCount > 0 ? ` (${parkedCount} active task(s) parked)` : "";
 
+    // ── Step 3: install + build (safe while gateway runs — modules cached in memory) ──
+    sendStatus(`[${cfg.agentId}] Code pulled. Installing dependencies...${parkedNote}`);
+    logger.info("[self-update] Running pnpm install...");
+    execSync("pnpm install --frozen-lockfile", {
+      cwd: projectRoot,
+      encoding: "utf-8",
+      stdio: "pipe",
+      timeout: 120_000,
+    });
+
+    sendStatus(`[${cfg.agentId}] Building project...`);
+    logger.info("[self-update] Running pnpm build...");
+    execSync("pnpm build", {
+      cwd: projectRoot,
+      encoding: "utf-8",
+      stdio: "pipe",
+      timeout: 120_000,
+    });
+    logger.info("[self-update] Build complete.");
+
+    // ── Step 4: write marker for post-restart version report ──
     writeSelfUpdateMarker(cfg, msg.from);
 
-    sendStatus(`[${cfg.agentId}] Code pulled. Shutting down for rebuild & restart...${parkedNote}`);
-    logger.info(
-      "[self-update] Code pulled. Exiting with code 42 — run-node.mjs will install, build, and relaunch.",
-    );
+    sendStatus(`[${cfg.agentId}] Build complete. Restarting gateway...`);
+
+    // ── Step 5: spawn a restart helper and exit ──
+    // The helper waits for this process to release the port/lock, then
+    // relaunches with the exact same arguments so it stays in the terminal.
+    scheduleGatewayRestart(projectRoot, logger);
 
     await new Promise((r) => setTimeout(r, 500));
-    process.exit(SELF_UPDATE_EXIT_CODE);
+    process.exit(0);
   } catch (err: any) {
     const stderr = err.stderr?.toString?.() ?? "";
     const stdout = err.stdout?.toString?.() ?? "";
@@ -768,6 +792,32 @@ async function handleSelfUpdate(
     logger.error(`[self-update] Update failed: ${detail}`);
     sendStatus(`[${cfg.agentId}] Update failed:\n${detail.slice(0, 500)}`);
   }
+}
+
+function scheduleGatewayRestart(projectRoot: string, logger: Logger): void {
+  const argv = process.argv;
+  const cwd = process.cwd();
+
+  // Inline Node.js script that waits for this process to exit, then relaunches.
+  const script = [
+    `const { spawn: _spawn } = require("child_process");`,
+    `const exe = ${JSON.stringify(argv[0])};`,
+    `const args = ${JSON.stringify(argv.slice(1))};`,
+    `const cwd = ${JSON.stringify(cwd)};`,
+    `setTimeout(() => {`,
+    `  const child = _spawn(exe, args, { cwd, stdio: "inherit" });`,
+    `  child.on("exit", (code) => process.exit(code ?? 0));`,
+    `}, 3000);`,
+  ].join("\n");
+
+  const helper = spawn(process.execPath, ["-e", script], {
+    cwd,
+    env: { ...process.env },
+    detached: true,
+    stdio: "inherit",
+  });
+  helper.unref();
+  logger.info(`[self-update] Restart helper spawned (pid=${helper.pid}), relaunching in 3s`);
 }
 
 function pollInbox(cfg: ChatroomConfig): InboxMessage[] {
