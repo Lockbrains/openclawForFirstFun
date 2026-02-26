@@ -608,39 +608,56 @@ function readAndClearSelfUpdateMarker(repoRoot?: string | null): {
 
 function ensureUpgradeChannel(cfg: ChatroomConfig): void {
   const root = chatroomRoot(cfg);
-  const indexPath = path.join(root, "channels", "_index.json");
-  const idx = readJson(indexPath);
-  if (!idx?.channels) return;
 
-  let upgradeChannel = idx.channels.find((ch: any) => ch.channel_id === UPGRADE_CHANNEL_ID);
-
-  if (!upgradeChannel) {
-    const allAgents = readAgentRegistry(cfg).map((a) => a.agent_id);
-    if (!allAgents.includes(cfg.agentId)) allAgents.push(cfg.agentId);
-    upgradeChannel = {
-      channel_id: UPGRADE_CHANNEL_ID,
-      display_name: "#upgrade",
-      type: "group",
-      members: allAgents,
-    };
-    idx.channels.push(upgradeChannel);
-    writeJson(indexPath, idx);
-  } else if (!upgradeChannel.members?.includes(cfg.agentId)) {
-    upgradeChannel.members.push(cfg.agentId);
-    writeJson(indexPath, idx);
-  }
+  // Always ensure the channel directory and meta.json exist, even if
+  // _index.json is missing or unreadable — this guarantees sendMessageToNAS
+  // can write messages and the web UI can discover the channel.
+  const allAgents = readAgentRegistry(cfg).map((a) => a.agent_id);
+  if (!allAgents.includes(cfg.agentId)) allAgents.push(cfg.agentId);
 
   const chDir = path.join(root, "channels", UPGRADE_CHANNEL_ID);
   ensureDir(path.join(chDir, "messages"));
   const metaPath = path.join(chDir, "meta.json");
   if (!fs.existsSync(metaPath)) {
-    writeJson(metaPath, upgradeChannel);
+    writeJson(metaPath, {
+      channel_id: UPGRADE_CHANNEL_ID,
+      display_name: "#upgrade",
+      type: "group",
+      members: allAgents,
+      message_count: 0,
+      last_message_seq: 0,
+    });
   } else {
     const meta = readJson(metaPath);
     if (meta && !meta.members?.includes(cfg.agentId)) {
+      meta.members = meta.members ?? [];
       meta.members.push(cfg.agentId);
       writeJson(metaPath, meta);
     }
+  }
+
+  // Also update _index.json if it exists
+  try {
+    const indexPath = path.join(root, "channels", "_index.json");
+    const idx = readJson(indexPath);
+    if (idx?.channels) {
+      const existing = idx.channels.find((ch: any) => ch.channel_id === UPGRADE_CHANNEL_ID);
+      if (!existing) {
+        idx.channels.push({
+          channel_id: UPGRADE_CHANNEL_ID,
+          display_name: "#upgrade",
+          type: "group",
+          members: allAgents,
+        });
+        writeJson(indexPath, idx);
+      } else if (!existing.members?.includes(cfg.agentId)) {
+        existing.members = existing.members ?? [];
+        existing.members.push(cfg.agentId);
+        writeJson(indexPath, idx);
+      }
+    }
+  } catch {
+    /* _index.json update is best-effort */
   }
 }
 
@@ -676,9 +693,11 @@ function isSelfUpdateAuthorized(msg: InboxMessage): boolean {
 
 function reportVersionToUpgrade(cfg: ChatroomConfig, extra?: string): void {
   ensureUpgradeChannel(cfg);
-  const version = readProjectVersion(cfg.repoRoot);
-  const commit = readProjectCommit(cfg.repoRoot);
+  const root = cfg.repoRoot ?? resolveGitRoot() ?? process.cwd();
+  const version = readProjectVersion(root);
+  const commit = readProjectCommit(root);
   let text = `[${cfg.agentId}] Current version: v${version} (${commit})`;
+  if (!cfg.repoRoot) text += `\n⚠ repoRoot not configured (using auto-detected: ${root})`;
   if (extra) text += `\n${extra}`;
   sendMessageToNAS(cfg, UPGRADE_CHANNEL_ID, text, "STATUS_UPDATE");
 }
@@ -688,25 +707,20 @@ async function handleSelfUpdate(
   msg: InboxMessage,
   logger: Logger,
 ): Promise<void> {
+  ensureUpgradeChannel(cfg);
+
+  const projectRoot = cfg.repoRoot ?? resolveGitRoot() ?? process.cwd();
+
   if (!cfg.repoRoot) {
-    const errMsg =
-      `[${cfg.agentId}] Cannot perform update: repoRoot is not configured. ` +
-      `Please run: firstclaw config set plugins.entries.agent-chatroom.config.repoRoot /path/to/your/firstclaw/repo`;
-    logger.error(`[self-update] ${errMsg}`);
-    try {
-      sendMessageToNAS(cfg, UPGRADE_CHANNEL_ID, errMsg, "STATUS_UPDATE");
-    } catch {
-      /* ignore */
-    }
-    return;
+    logger.warn(
+      `[self-update] repoRoot not configured — falling back to auto-detected "${projectRoot}". ` +
+        `For reliability, run: firstclaw config set plugins.entries.agent-chatroom.config.repoRoot ${projectRoot}`,
+    );
   }
 
-  const projectRoot = cfg.repoRoot;
   logger.info(
     `[self-update] Received update command from ${msg.from} in #${msg.channel_id} (root: ${projectRoot})`,
   );
-
-  ensureUpgradeChannel(cfg);
 
   const sendStatus = (text: string) => {
     try {
@@ -725,8 +739,13 @@ async function handleSelfUpdate(
     }).trim();
     logger.info(`[self-update] git pull: ${pullOutput}`);
 
-    if (pullOutput === "Already up to date.") {
-      reportVersionToUpgrade(cfg, "Already up to date.");
+    if (/already up[- ]to[- ]date/i.test(pullOutput)) {
+      try {
+        reportVersionToUpgrade(cfg, "Already up to date.");
+        logger.info("[self-update] Version report sent to #upgrade");
+      } catch (reportErr) {
+        logger.error(`[self-update] Failed to report version: ${reportErr}`);
+      }
       return;
     }
 
@@ -2176,6 +2195,14 @@ const agentChatroomPlugin = {
           ? ` — will ONLY process messages from dm_${agentId}`
           : ` — full orchestration enabled`),
     );
+    if (cfg.repoRoot) {
+      logger.info(`Repo root: ${cfg.repoRoot}`);
+    } else {
+      logger.warn(
+        `repoRoot is NOT configured — /system-update will not work. ` +
+          `Run: firstclaw config set plugins.entries.agent-chatroom.config.repoRoot /path/to/repo`,
+      );
+    }
 
     // ── Orchestrator-only tools ─────────────────────────────────────────────
     // dispatch_task, cancel_task, task_status are only useful for the orchestrator.
@@ -3106,10 +3133,11 @@ const agentChatroomPlugin = {
 
         // Post-update version report
         try {
-          const marker = readAndClearSelfUpdateMarker(cfg.repoRoot);
+          const repoRoot = cfg.repoRoot ?? resolveGitRoot() ?? process.cwd();
+          const marker = readAndClearSelfUpdateMarker(repoRoot);
           if (marker) {
-            const newVersion = readProjectVersion(cfg.repoRoot);
-            const commit = readProjectCommit(cfg.repoRoot);
+            const newVersion = readProjectVersion(repoRoot);
+            const commit = readProjectCommit(repoRoot);
             ensureUpgradeChannel(cfg);
             const prev = marker.previous_version;
             sendMessageToNAS(
