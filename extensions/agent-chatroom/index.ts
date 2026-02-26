@@ -534,6 +534,7 @@ function updateHeartbeat(cfg: ChatroomConfig): void {
 // ============================================================================
 
 const UPGRADE_CHANNEL_ID = "upgrade";
+const SURVIVAL_CHANNEL_ID = "survival";
 const SELF_UPDATE_MARKER = ".self-update-pending.json";
 
 function resolveGitRoot(): string | null {
@@ -658,6 +659,73 @@ function ensureUpgradeChannel(cfg: ChatroomConfig): void {
   } catch {
     /* _index.json update is best-effort */
   }
+}
+
+function ensureSurvivalChannel(cfg: ChatroomConfig): void {
+  const root = chatroomRoot(cfg);
+  const allAgents = readAgentRegistry(cfg).map((a) => a.agent_id);
+  if (!allAgents.includes(cfg.agentId)) allAgents.push(cfg.agentId);
+
+  const chDir = path.join(root, "channels", SURVIVAL_CHANNEL_ID);
+  ensureDir(path.join(chDir, "messages"));
+  const metaPath = path.join(chDir, "meta.json");
+  if (!fs.existsSync(metaPath)) {
+    writeJson(metaPath, {
+      channel_id: SURVIVAL_CHANNEL_ID,
+      display_name: "#survival",
+      type: "group",
+      members: allAgents,
+      message_count: 0,
+      last_message_seq: 0,
+    });
+  } else {
+    const meta = readJson(metaPath);
+    if (meta && !meta.members?.includes(cfg.agentId)) {
+      meta.members = meta.members ?? [];
+      meta.members.push(cfg.agentId);
+      writeJson(metaPath, meta);
+    }
+  }
+
+  try {
+    const indexPath = path.join(root, "channels", "_index.json");
+    const idx = readJson(indexPath);
+    if (idx?.channels) {
+      const existing = idx.channels.find((ch: any) => ch.channel_id === SURVIVAL_CHANNEL_ID);
+      if (!existing) {
+        idx.channels.push({
+          channel_id: SURVIVAL_CHANNEL_ID,
+          display_name: "#survival",
+          type: "group",
+          members: allAgents,
+        });
+        writeJson(indexPath, idx);
+      } else if (!existing.members?.includes(cfg.agentId)) {
+        existing.members = existing.members ?? [];
+        existing.members.push(cfg.agentId);
+        writeJson(indexPath, idx);
+      }
+    }
+  } catch {
+    /* _index.json update is best-effort */
+  }
+}
+
+function isSurvivalCheckCommand(msg: InboxMessage): boolean {
+  if (msg.metadata?.system_command === "survival_check") return true;
+  const text = msg.content?.text?.trim() ?? "";
+  if (/^\/survival\b/i.test(text)) return true;
+  return false;
+}
+
+function handleSurvivalCheck(cfg: ChatroomConfig, msg: InboxMessage, logger: Logger): void {
+  ensureSurvivalChannel(cfg);
+  const channelId =
+    msg.channel_id === SURVIVAL_CHANNEL_ID ? SURVIVAL_CHANNEL_ID : SURVIVAL_CHANNEL_ID;
+  const timestamp = new Date().toISOString();
+  const text = `[${cfg.agentId}] 🟢 I am listening. (${timestamp})`;
+  logger.info(`[survival] Responding to survival check from ${msg.from}`);
+  sendMessageToNAS(cfg, channelId, text, "STATUS_UPDATE");
 }
 
 function pauseActiveTasksForUpgrade(cfg: ChatroomConfig, logger: Logger): number {
@@ -3231,8 +3299,19 @@ const agentChatroomPlugin = {
                   continue;
                 }
 
+                // ── Survival check gate: respond immediately without LLM ──
+                if (isSurvivalCheckCommand(msg)) {
+                  handleSurvivalCheck(cfg, msg, logger);
+                  continue;
+                }
+
                 // ── #upgrade is a system-only channel — never forward to LLM ──
                 if (msg.channel_id === UPGRADE_CHANNEL_ID) {
+                  continue;
+                }
+
+                // ── #survival is a system-only channel — never forward to LLM ──
+                if (msg.channel_id === SURVIVAL_CHANNEL_ID) {
                   continue;
                 }
 
