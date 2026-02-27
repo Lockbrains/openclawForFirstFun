@@ -23,6 +23,7 @@ import type { FirstClawPluginApi } from "firstclaw/plugin-sdk";
 import { Type } from "@sinclair/typebox";
 import { createReplyPrefixContext, type ReplyPayload } from "firstclaw/plugin-sdk";
 import { execSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -261,6 +262,164 @@ function scanOutputDir(dir: string): string[] {
     if (entry.isFile()) files.push(toForwardSlash(path.join(dir, entry.name)));
   }
   return files;
+}
+
+// ============================================================================
+// Reliable file transfer helpers
+// ============================================================================
+
+function md5File(filePath: string): string {
+  const data = fs.readFileSync(filePath);
+  return createHash("md5").update(data).digest("hex");
+}
+
+interface PublishResult {
+  nasPath: string;
+  sourceSize: number;
+  destSize: number;
+  md5: string;
+  verified: boolean;
+}
+
+/**
+ * Binary-safe copy from local filesystem to NAS with integrity verification.
+ * Uses fs.copyFileSync (kernel-level copy) — never passes content through LLM context.
+ */
+function publishFileToNAS(sourcePath: string, destDir: string, filename?: string): PublishResult {
+  if (!fs.existsSync(sourcePath)) {
+    throw new Error(`Source file does not exist: ${sourcePath}`);
+  }
+  const stat = fs.statSync(sourcePath);
+  if (!stat.isFile()) {
+    throw new Error(`Source is not a file: ${sourcePath}`);
+  }
+  if (stat.size === 0) {
+    throw new Error(`Source file is empty (0 bytes): ${sourcePath}`);
+  }
+
+  const targetName = filename ?? path.basename(sourcePath);
+  ensureDir(destDir);
+  const destPath = toForwardSlash(path.join(destDir, targetName));
+
+  const sourceMd5 = md5File(sourcePath);
+  fs.copyFileSync(sourcePath, destPath);
+
+  const destStat = fs.statSync(destPath);
+  const destMd5 = md5File(destPath);
+
+  if (destStat.size !== stat.size || destMd5 !== sourceMd5) {
+    // Retry once
+    fs.copyFileSync(sourcePath, destPath);
+    const retryStat = fs.statSync(destPath);
+    const retryMd5 = md5File(destPath);
+    if (retryStat.size !== stat.size || retryMd5 !== sourceMd5) {
+      throw new Error(
+        `File verification failed after retry. ` +
+          `Source: ${stat.size}b/${sourceMd5}, Dest: ${retryStat.size}b/${retryMd5}`,
+      );
+    }
+  }
+
+  return {
+    nasPath: destPath,
+    sourceSize: stat.size,
+    destSize: destStat.size,
+    md5: sourceMd5,
+    verified: true,
+  };
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+const BINARY_EXTENSIONS = new Set([
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".gif",
+  ".webp",
+  ".bmp",
+  ".ico",
+  ".svg",
+  ".tiff",
+  ".tif",
+  ".mp3",
+  ".wav",
+  ".ogg",
+  ".flac",
+  ".aac",
+  ".m4a",
+  ".wma",
+  ".mp4",
+  ".avi",
+  ".mov",
+  ".mkv",
+  ".webm",
+  ".flv",
+  ".wmv",
+  ".pdf",
+  ".doc",
+  ".docx",
+  ".xls",
+  ".xlsx",
+  ".ppt",
+  ".pptx",
+  ".zip",
+  ".tar",
+  ".gz",
+  ".bz2",
+  ".7z",
+  ".rar",
+  ".obj",
+  ".fbx",
+  ".gltf",
+  ".glb",
+  ".stl",
+  ".blend",
+  ".psd",
+  ".ai",
+  ".sketch",
+  ".fig",
+  ".ttf",
+  ".otf",
+  ".woff",
+  ".woff2",
+  ".bin",
+  ".dat",
+  ".db",
+  ".sqlite",
+]);
+
+/**
+ * Detect if a "content" string is actually a file path that the LLM mistakenly
+ * passed instead of actual file content. Returns the resolved path if it looks
+ * like an existing file, or null.
+ */
+function detectMisusedFilePath(content: string): string | null {
+  const trimmed = content.trim();
+  if (trimmed.length > 1024) return null;
+  if (trimmed.includes("\n")) return null;
+
+  const looksLikePath =
+    trimmed.startsWith("/") ||
+    trimmed.startsWith("\\\\") ||
+    trimmed.startsWith("~/") ||
+    /^[A-Za-z]:[/\\]/.test(trimmed);
+
+  if (!looksLikePath) return null;
+
+  try {
+    if (fs.existsSync(trimmed) && fs.statSync(trimmed).isFile()) {
+      return trimmed;
+    }
+  } catch {
+    /* ignore */
+  }
+  return null;
 }
 
 // ============================================================================
@@ -1512,7 +1671,7 @@ function monitorParkedTasks(cfg: ChatroomConfig, runtime: any, config: any, logg
             `You may now proceed with the operation. Resume instructions:`,
             info.resume_prompt,
             ``,
-            `Continue processing this task. Save outputs with chatroom_save_asset(task_id="${info.task_id}").`,
+            `Continue processing this task. For binary files use chatroom_publish_file(source_path="...", task_id="${info.task_id}"), for text use chatroom_save_asset(task_id="${info.task_id}").`,
             `Your final text response will be delivered as the task result.`,
           ].join("\n")
         : [
@@ -1526,7 +1685,7 @@ function monitorParkedTasks(cfg: ChatroomConfig, runtime: any, config: any, logg
             `Resume instructions from the agent:`,
             info.resume_prompt,
             ``,
-            `Continue processing this task. Save outputs with chatroom_save_asset(task_id="${info.task_id}").`,
+            `Continue processing this task. For binary files use chatroom_publish_file(source_path="...", task_id="${info.task_id}"), for text use chatroom_save_asset(task_id="${info.task_id}").`,
             `Your final text response will be delivered as the task result.`,
           ].join("\n");
 
@@ -1937,9 +2096,17 @@ function buildOrchestratorContext(cfg: ChatroomConfig, sourceChannel?: string): 
     `  Example: chatroom_dispatch_task(target="art", instruction="draw a steel dinosaur")`,
   );
   lines.push(``);
-  lines.push(`═══ File Sharing ═══`);
-  lines.push(`  To send a file as a chat message: use chatroom_send_file.`);
-  lines.push(`  To save a file without sending a message: use chatroom_save_asset.`);
+  lines.push(`═══ File Sharing Protocol ═══`);
+  lines.push(`  Binary files (images, audio, PDFs, models):`);
+  lines.push(`    chatroom_publish_file       — copy local file to NAS (verified)`);
+  lines.push(`    chatroom_publish_and_send   — copy to NAS + send as chat message`);
+  lines.push(`  Text/generated content:`);
+  lines.push(`    chatroom_save_asset         — write text content to NAS`);
+  lines.push(`    chatroom_send_file          — write content + send as message`);
+  lines.push(`  Discovery:`);
+  lines.push(`    chatroom_list_assets        — browse files on NAS`);
+  lines.push(`  IMPORTANT: For binary files, ALWAYS use chatroom_publish_file/publish_and_send.`);
+  lines.push(`  These perform direct binary copy with MD5 verification — no base64 needed.`);
   lines.push(``);
 
   const activeTasks = listTasksByStatus(
@@ -2001,6 +2168,15 @@ function buildWorkerContext(cfg: ChatroomConfig, sourceChannel?: string): string
     `═══ File System (NAS) ═══`,
     `  Your output dir: ${myAssets}`,
     sourceChannel ? `  Current channel: #${sourceChannel}` : ``,
+    ``,
+    `═══ File Sharing Protocol ═══`,
+    `  Binary files (images, audio, PDFs, models):`,
+    `    chatroom_publish_file(source_path="/local/path/file.png", task_id="...")`,
+    `    chatroom_publish_and_send(source_path="/local/path/file.png", channel_id="...", task_id="...")`,
+    `  Text/generated content:`,
+    `    chatroom_save_asset(filename="report.md", content="...", task_id="...")`,
+    `  IMPORTANT: For binary files, ALWAYS use chatroom_publish_file/publish_and_send.`,
+    `  These perform direct binary copy with MD5 verification — never use base64 for local files.`,
     ``,
   ];
 
@@ -2141,12 +2317,25 @@ async function autoDispatchForTask(
     msg.content.text,
     ``,
     `RULES (MUST follow — violations break the pipeline):`,
-    `1. SAVE all output files using chatroom_save_asset with task_id="${taskId}".`,
-    `   This stores them in the correct NAS directory: ${outputDir}`,
-    `   For binary files (images, audio): chatroom_save_asset(filename="output.png", content="<base64>", encoding="base64", task_id="${taskId}")`,
-    `   For text files: chatroom_save_asset(filename="report.md", content="...", task_id="${taskId}")`,
-    `2. To share files visually (so others can see images/download files), use chatroom_send_file:`,
-    `   chatroom_send_file(channel_id="${msg.channel_id}", filename="output.png", content="<base64>", encoding="base64", task_id="${taskId}")`,
+    `1. FILE SHARING PROTOCOL — choose the right tool:`,
+    `   ┌─────────────────────────────────────────────────────────────────────────┐`,
+    `   │ chatroom_publish_file    — PREFERRED for ALL local files (binary-safe) │`,
+    `   │   Copies the file directly from disk to NAS. No base64, no content.    │`,
+    `   │   Example: chatroom_publish_file(source_path="/workspace/out/render.png", task_id="${taskId}")`,
+    `   │                                                                         │`,
+    `   │ chatroom_publish_and_send — publish + send as chat message (one step)  │`,
+    `   │   Example: chatroom_publish_and_send(source_path="/workspace/out/render.png",`,
+    `   │     channel_id="${msg.channel_id}", task_id="${taskId}")                │`,
+    `   │                                                                         │`,
+    `   │ chatroom_save_asset      — ONLY for dynamically generated text content │`,
+    `   │   Example: chatroom_save_asset(filename="report.md", content="...", task_id="${taskId}")`,
+    `   └─────────────────────────────────────────────────────────────────────────┘`,
+    `   CRITICAL: For binary files (images, audio, PDFs, models, etc.),`,
+    `   ALWAYS use chatroom_publish_file or chatroom_publish_and_send.`,
+    `   NEVER read a binary file and pass its content as base64 — this is fragile and wastes tokens.`,
+    `   Output directory: ${outputDir}`,
+    `2. To share files visually (so others can see images/download files):`,
+    `   chatroom_publish_and_send(source_path="/workspace/out/render.png", channel_id="${msg.channel_id}", task_id="${taskId}")`,
     `3. REPORT PROGRESS at significant milestones using chatroom_task_progress:`,
     `   chatroom_task_progress(task_id="${taskId}", phase="analyzing", detail="Reading the requirements")`,
     `   chatroom_task_progress(task_id="${taskId}", phase="generating", detail="Creating output")`,
@@ -2561,21 +2750,23 @@ const agentChatroomPlugin = {
         name: "chatroom_save_asset",
         label: "Chatroom: Save Asset",
         description:
-          "Save a file to the NAS shared storage. Use this when completing a task to ensure " +
-          "your output is stored in the correct location.\n" +
-          "The file will be saved to your agent's asset directory on the NAS.\n" +
-          "Provide the content as text (for text files) or base64 (for binary files).",
+          "Save generated text content to NAS. For BINARY FILES that already exist on disk,\n" +
+          "use chatroom_publish_file instead (it's faster, safer, and doesn't need base64).\n" +
+          "This tool is best for: dynamically generated text, markdown reports, JSON, config files.\n" +
+          "If you pass a file path as content by mistake, it will be auto-detected and copied correctly.",
         parameters: Type.Object({
           filename: Type.String({
-            description: "File name (e.g. 'steel_dinosaur.png', 'report.md')",
+            description: "File name (e.g. 'report.md', 'config.json')",
           }),
           content: Type.String({
             description:
-              "File content — plain text for text files, base64-encoded string for binary files",
+              "File content — plain text for text files, base64-encoded string for binary files. " +
+              "WARNING: for binary files on disk, use chatroom_publish_file(source_path=...) instead.",
           }),
           encoding: Type.Optional(
             Type.String({
-              description: "'text' (default) or 'base64' for binary files",
+              description:
+                "'text' (default) or 'base64'. Prefer chatroom_publish_file for binary files.",
             }),
           ),
           task_id: Type.Optional(
@@ -2596,15 +2787,51 @@ const agentChatroomPlugin = {
             const dir = p.task_id
               ? taskAssetsDir(cfg, cfg.agentId, p.task_id)
               : assetsDir(cfg, cfg.agentId);
+
+            // Guard: detect if content is actually a file path
+            const detectedPath = detectMisusedFilePath(p.content);
+            if (detectedPath) {
+              const result = publishFileToNAS(detectedPath, dir, p.filename);
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text:
+                      `[AUTO-CORRECTED] Detected file path in content — copied file directly instead.\n` +
+                      `File published to NAS (verified): ${result.nasPath} (${formatFileSize(result.sourceSize)}, MD5: ${result.md5})\n` +
+                      `TIP: Next time, use chatroom_publish_file(source_path="${detectedPath}") for binary files.`,
+                  },
+                ],
+                details: result,
+              };
+            }
+
             ensureDir(dir);
             const filePath = toForwardSlash(path.join(dir, p.filename));
 
             if (p.encoding === "base64") {
-              fs.writeFileSync(filePath, Buffer.from(p.content, "base64"));
-            } else {
-              fs.writeFileSync(filePath, p.content, "utf-8");
+              const buf = Buffer.from(p.content, "base64");
+              fs.writeFileSync(filePath, buf);
+              const ext = path.extname(p.filename).toLowerCase();
+              const sizeNote =
+                buf.length > 512 * 1024
+                  ? ` (large file — consider chatroom_publish_file for better reliability)`
+                  : "";
+              const binNote = BINARY_EXTENSIONS.has(ext)
+                ? `\nTIP: For binary files on disk, chatroom_publish_file(source_path=...) is more reliable than base64.`
+                : "";
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: `File saved: ${filePath} (${formatFileSize(buf.length)})${sizeNote}${binNote}`,
+                  },
+                ],
+                details: { path: filePath, size: buf.length },
+              };
             }
 
+            fs.writeFileSync(filePath, p.content, "utf-8");
             return {
               content: [
                 {
@@ -2711,11 +2938,11 @@ const agentChatroomPlugin = {
         name: "chatroom_send_file",
         label: "Chatroom: Upload & Send File",
         description:
-          "Upload a file to NAS and send it as a chat message in one step.\n" +
-          "The file is saved to your agent's asset directory and a message with the file " +
-          "attached is posted to the specified channel.\n" +
-          "Images will be displayed inline in the chatroom UI. Other files appear as download links.\n" +
-          "For binary files (images, audio, etc.), set encoding to 'base64'.",
+          "Upload generated content to NAS and send as a chat message.\n" +
+          "For BINARY FILES already on disk (images, audio, etc.), use chatroom_publish_and_send instead —\n" +
+          "it copies the file directly without base64, with integrity verification.\n" +
+          "This tool is best for: text content you want to both save and share in one step.\n" +
+          "If you pass a file path as content by mistake, it will be auto-detected and copied correctly.",
         parameters: Type.Object({
           channel_id: Type.String({
             description: "Target channel ID (e.g. 'general', 'pipeline')",
@@ -2725,11 +2952,13 @@ const agentChatroomPlugin = {
           }),
           content: Type.String({
             description:
-              "File content — plain text for text files, base64-encoded string for binary files",
+              "File content — plain text for text files, base64-encoded string for binary files. " +
+              "WARNING: for local binary files, use chatroom_publish_and_send(source_path=...) instead.",
           }),
           encoding: Type.Optional(
             Type.String({
-              description: "'text' (default) or 'base64' for binary files like images",
+              description:
+                "'text' (default) or 'base64'. Prefer chatroom_publish_and_send for binary files.",
             }),
           ),
           text: Type.Optional(
@@ -2770,6 +2999,39 @@ const agentChatroomPlugin = {
             const dir = p.task_id
               ? taskAssetsDir(cfg, cfg.agentId, p.task_id)
               : assetsDir(cfg, cfg.agentId);
+
+            // Guard: detect if content is actually a file path
+            const detectedPath = detectMisusedFilePath(p.content);
+            if (detectedPath) {
+              const pubResult = publishFileToNAS(detectedPath, dir, p.filename);
+              const displayName = p.filename ?? path.basename(detectedPath);
+              const msgText = p.text ?? `📎 ${displayName}`;
+              const sendResult = sendMessageToNAS(
+                cfg,
+                p.channel_id,
+                msgText,
+                "CHAT",
+                [],
+                undefined,
+                {
+                  asset_paths: [pubResult.nasPath],
+                },
+              );
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text:
+                      `[AUTO-CORRECTED] Detected file path in content — copied file directly.\n` +
+                      `File published and sent to #${p.channel_id} (seq: ${sendResult.seq}, verified):\n` +
+                      `  NAS path: ${pubResult.nasPath} (${formatFileSize(pubResult.sourceSize)}, MD5: ${pubResult.md5})\n` +
+                      `TIP: Next time, use chatroom_publish_and_send(source_path="${detectedPath}") for binary files.`,
+                  },
+                ],
+                details: { ...pubResult, seq: sendResult.seq },
+              };
+            }
+
             ensureDir(dir);
             const filePath = toForwardSlash(path.join(dir, p.filename));
 
@@ -2805,6 +3067,266 @@ const agentChatroomPlugin = {
         },
       },
       { names: ["chatroom_send_file"] },
+    );
+
+    // ── Tool: publish file (binary-safe copy to NAS) ────────────────────────
+
+    api.registerTool(
+      {
+        name: "chatroom_publish_file",
+        label: "Chatroom: Publish File to NAS",
+        description:
+          "Copy a file from your local filesystem to NAS shared storage with integrity verification.\n" +
+          "This is the PREFERRED method for sharing binary files (images, audio, PDFs, models, etc.).\n" +
+          "Unlike chatroom_save_asset (which requires base64 content), this tool takes a SOURCE PATH\n" +
+          "and performs a direct binary copy — reliable for files of any size.\n" +
+          "The file is verified after copy (size + MD5 checksum).\n\n" +
+          "Returns the NAS path that can be referenced in messages via asset_paths.",
+        parameters: Type.Object({
+          source_path: Type.String({
+            description:
+              "Absolute path to the file on your local filesystem (e.g. '/workspace/output/render.png')",
+          }),
+          filename: Type.Optional(
+            Type.String({
+              description: "Target filename on NAS. Defaults to the source file's basename.",
+            }),
+          ),
+          task_id: Type.Optional(
+            Type.String({
+              description:
+                "Task ID — saves to the task-specific output directory. If omitted, saves to your general agent directory.",
+            }),
+          ),
+        }),
+        async execute(_toolCallId, params) {
+          try {
+            const p = params as {
+              source_path: string;
+              filename?: string;
+              task_id?: string;
+            };
+            const dir = p.task_id
+              ? taskAssetsDir(cfg, cfg.agentId, p.task_id)
+              : assetsDir(cfg, cfg.agentId);
+            const result = publishFileToNAS(p.source_path, dir, p.filename);
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text:
+                    `File published to NAS (verified):\n` +
+                    `  Source: ${p.source_path}\n` +
+                    `  NAS path: ${result.nasPath}\n` +
+                    `  Size: ${formatFileSize(result.sourceSize)}\n` +
+                    `  MD5: ${result.md5}`,
+                },
+              ],
+              details: result,
+            };
+          } catch (err) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `Error publishing file: ${err}`,
+                },
+              ],
+              details: undefined,
+            };
+          }
+        },
+      },
+      { names: ["chatroom_publish_file"] },
+    );
+
+    // ── Tool: publish file and send as message ──────────────────────────────
+
+    api.registerTool(
+      {
+        name: "chatroom_publish_and_send",
+        label: "Chatroom: Publish File & Send Message",
+        description:
+          "Copy a local file to NAS AND send it as a chat message in one step.\n" +
+          "This is the PREFERRED method for sharing binary files with the team.\n" +
+          "The file is copied directly (binary-safe, not base64) and verified.\n" +
+          "Images will be displayed inline in the chatroom UI.",
+        parameters: Type.Object({
+          source_path: Type.String({
+            description:
+              "Absolute path to the file on your local filesystem (e.g. '/workspace/output/render.png')",
+          }),
+          channel_id: Type.String({
+            description: "Target channel ID (e.g. 'general', 'pipeline', 'dm_art')",
+          }),
+          filename: Type.Optional(
+            Type.String({
+              description: "Target filename on NAS. Defaults to the source file's basename.",
+            }),
+          ),
+          text: Type.Optional(
+            Type.String({
+              description: "Message text to accompany the file. Defaults to the filename.",
+            }),
+          ),
+          task_id: Type.Optional(
+            Type.String({
+              description: "If part of a task, saves to the task-specific directory.",
+            }),
+          ),
+        }),
+        async execute(_toolCallId, params) {
+          try {
+            const p = params as {
+              source_path: string;
+              channel_id: string;
+              filename?: string;
+              text?: string;
+              task_id?: string;
+            };
+
+            if (cfg.role !== "orchestrator" && p.channel_id === "general") {
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: `Blocked: #general is reserved for the orchestrator. Use your DM channel (dm_${cfg.agentId}) instead.`,
+                  },
+                ],
+                details: undefined,
+              };
+            }
+
+            const dir = p.task_id
+              ? taskAssetsDir(cfg, cfg.agentId, p.task_id)
+              : assetsDir(cfg, cfg.agentId);
+            const result = publishFileToNAS(p.source_path, dir, p.filename);
+
+            const displayName = p.filename ?? path.basename(p.source_path);
+            const msgText = p.text ?? `📎 ${displayName}`;
+            const sendResult = sendMessageToNAS(cfg, p.channel_id, msgText, "CHAT", [], undefined, {
+              asset_paths: [result.nasPath],
+            });
+
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text:
+                    `File published and message sent to #${p.channel_id} (seq: ${sendResult.seq}, verified):\n` +
+                    `  NAS path: ${result.nasPath}\n` +
+                    `  Size: ${formatFileSize(result.sourceSize)} | MD5: ${result.md5}`,
+                },
+              ],
+              details: { ...result, seq: sendResult.seq },
+            };
+          } catch (err) {
+            return {
+              content: [{ type: "text" as const, text: `Error: ${err}` }],
+              details: undefined,
+            };
+          }
+        },
+      },
+      { names: ["chatroom_publish_and_send"] },
+    );
+
+    // ── Tool: list assets on NAS ────────────────────────────────────────────
+
+    api.registerTool(
+      {
+        name: "chatroom_list_assets",
+        label: "Chatroom: List Assets",
+        description:
+          "List files stored on NAS for a given agent or shared directory.\n" +
+          "Use to discover what files are available for reference or download.",
+        parameters: Type.Object({
+          scope: Type.Optional(
+            Type.String({
+              description:
+                "'mine' (default) — your own asset directory, 'shared' — shared assets, " +
+                "or an agent ID to list that agent's assets.",
+            }),
+          ),
+          task_id: Type.Optional(
+            Type.String({
+              description: "If provided, list only the task-specific subdirectory.",
+            }),
+          ),
+        }),
+        async execute(_toolCallId, params) {
+          try {
+            const p = params as { scope?: string; task_id?: string };
+            const scope = p.scope ?? "mine";
+            let targetDir: string;
+
+            if (scope === "mine") {
+              targetDir = p.task_id
+                ? taskAssetsDir(cfg, cfg.agentId, p.task_id)
+                : assetsDir(cfg, cfg.agentId);
+            } else if (scope === "shared") {
+              targetDir = assetsDir(cfg, "shared");
+            } else {
+              targetDir = p.task_id ? taskAssetsDir(cfg, scope, p.task_id) : assetsDir(cfg, scope);
+            }
+
+            if (!fs.existsSync(targetDir)) {
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: `Directory does not exist: ${targetDir}`,
+                  },
+                ],
+                details: { files: [], dir: targetDir },
+              };
+            }
+
+            const entries = fs.readdirSync(targetDir, { withFileTypes: true });
+            const files: { name: string; path: string; size: string; type: string }[] = [];
+            const dirs: string[] = [];
+
+            for (const entry of entries) {
+              if (entry.isFile()) {
+                const fullPath = toForwardSlash(path.join(targetDir, entry.name));
+                const stat = fs.statSync(fullPath);
+                files.push({
+                  name: entry.name,
+                  path: fullPath,
+                  size: formatFileSize(stat.size),
+                  type: path.extname(entry.name).toLowerCase() || "(no ext)",
+                });
+              } else if (entry.isDirectory()) {
+                dirs.push(entry.name);
+              }
+            }
+
+            const lines: string[] = [`Directory: ${targetDir}`];
+            if (dirs.length > 0) {
+              lines.push(`Subdirectories: ${dirs.join(", ")}`);
+            }
+            if (files.length === 0) {
+              lines.push(`(empty — no files)`);
+            } else {
+              lines.push(`Files (${files.length}):`);
+              for (const f of files) {
+                lines.push(`  ${f.name}  ${f.size}  ${f.type}`);
+              }
+            }
+
+            return {
+              content: [{ type: "text" as const, text: lines.join("\n") }],
+              details: { dir: targetDir, files, dirs },
+            };
+          } catch (err) {
+            return {
+              content: [{ type: "text" as const, text: `Error: ${err}` }],
+              details: undefined,
+            };
+          }
+        },
+      },
+      { names: ["chatroom_list_assets"] },
     );
 
     // ── Tool: list channels ─────────────────────────────────────────────────
