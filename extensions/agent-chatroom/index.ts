@@ -2016,7 +2016,10 @@ function handleIncomingTask(
 
   if (usePlanMode) {
     logger.info(`Task ${taskId}: using Plan Mode (long_running=${isLongRunning})`);
-    handlePlanModeTask(cfg, msg, taskId, runtime, config, logger);
+    handlePlanModeTask(cfg, msg, taskId, runtime, config, logger).catch((err) => {
+      logger.error(`Plan mode unhandled error for task ${taskId}: ${err}`);
+      sendTaskResult(cfg, taskId, `Plan mode crashed: ${err}`, "FAILED", logger);
+    });
   } else {
     logger.info(`Task ${taskId}: using direct execution (simple task)`);
     autoDispatchForTask(cfg, msg, taskId, runtime, config, logger);
@@ -2044,9 +2047,10 @@ async function handlePlanModeTask(
     }
 
     // Phase 1.5: Approval
+    logger.info(`Task ${taskId}: waiting for plan approval (mode: ${plan.approval.mode})`);
     const approvedPlan = await waitForApproval(cfg, plan, taskId, logger);
     if (!approvedPlan) {
-      logger.info(`Plan for task ${taskId} was not approved`);
+      logger.warn(`Plan for task ${taskId} was not approved — approval returned null`);
       const existingTask = readTaskRecord(cfg, taskId);
       if (existingTask && existingTask.status !== "CANCELLED" && existingTask.status !== "FAILED") {
         sendTaskResult(cfg, taskId, "Plan was rejected or approval timed out", "FAILED", logger);
@@ -2055,6 +2059,9 @@ async function handlePlanModeTask(
     }
 
     // Phase 2: Step-by-step execution
+    logger.info(
+      `Task ${taskId}: plan approved, starting step execution (${approvedPlan.steps.length} steps)`,
+    );
     await stepExecutionLoop(cfg, approvedPlan, msg, taskId, runtime, config, logger);
   } catch (err) {
     logger.error(`Plan mode error for task ${taskId}: ${err}`);
@@ -2739,10 +2746,26 @@ async function waitForApproval(
     const approvalTimeoutMs = 5 * 60_000;
     const pollMs = 3_000;
     const deadline = Date.now() + approvalTimeoutMs;
+    let consecutiveReadFailures = 0;
 
     while (Date.now() < deadline) {
       const current = readPlan(cfg, taskId);
-      if (!current) return null;
+      if (!current) {
+        // NAS/SMB file read may transiently fail — retry instead of aborting
+        consecutiveReadFailures++;
+        if (consecutiveReadFailures > 10) {
+          logger.warn(
+            `Plan file for task ${taskId} unreadable after ${consecutiveReadFailures} attempts`,
+          );
+          return null;
+        }
+        logger.info(
+          `Plan read returned null for task ${taskId}, retrying (${consecutiveReadFailures})`,
+        );
+        await new Promise((r) => setTimeout(r, pollMs));
+        continue;
+      }
+      consecutiveReadFailures = 0;
 
       if (current.status === "APPROVED") {
         logger.info(`Plan for task ${taskId} approved by ${current.approval.approved_by}`);
@@ -2793,11 +2816,25 @@ async function waitForApproval(
   const humanPollMs = 5_000;
   const humanDeadlineMs = 60 * 60_000; // 1 hour max wait
   const humanDeadline = Date.now() + humanDeadlineMs;
+  let humanReadFailures = 0;
 
   while (Date.now() < humanDeadline) {
     const current = readPlan(cfg, taskId);
-    if (!current) return null;
-    if (current.status === "APPROVED") return current;
+    if (!current) {
+      humanReadFailures++;
+      if (humanReadFailures > 10) {
+        logger.warn(`Plan file for task ${taskId} unreadable after ${humanReadFailures} attempts`);
+        return null;
+      }
+      await new Promise((r) => setTimeout(r, humanPollMs));
+      continue;
+    }
+    humanReadFailures = 0;
+
+    if (current.status === "APPROVED") {
+      logger.info(`Plan for task ${taskId} approved by ${current.approval.approved_by}`);
+      return current;
+    }
     if (current.status === "CANCELLED") return null;
 
     const task = readTaskRecord(cfg, taskId);
@@ -3064,6 +3101,13 @@ async function executeStep(
             output_files: [],
             error_detail: text.slice(0, 500),
           };
+        } else if (stepResult.success === false && stepResult.error_detail) {
+          // onError already fired — keep the failure, don't override with implicit success
+          updatePlanStep(chatroomCfg, taskId, step.step_id, {
+            status: "FAILED",
+            error_detail: stepResult.error_detail,
+            completed_at: nowISO(),
+          });
         } else {
           // LLM finished but didn't call complete_step — treat as implicit success
           const producedFiles = scanOutputDir(outputDir);
