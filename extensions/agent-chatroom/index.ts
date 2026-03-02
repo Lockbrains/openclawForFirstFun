@@ -3673,6 +3673,48 @@ const agentChatroomPlugin = {
                   error_detail: `Plan rejected: ${p.reason ?? "no reason"}`,
                 } as Partial<TaskRecord>);
               }
+
+              // Send approval decision to DM channel
+              const approvalTask = readTaskRecord(cfg, p.task_id);
+              if (approvalTask) {
+                const decisionEmoji =
+                  p.decision === "approved" ? "✅" : p.decision === "rejected" ? "❌" : "🔄";
+                const decisionLabel =
+                  p.decision === "approved"
+                    ? "Plan Approved"
+                    : p.decision === "rejected"
+                      ? "Plan Rejected"
+                      : "Revision Requested";
+                const msgType =
+                  p.decision === "approved"
+                    ? "PLAN_APPROVED"
+                    : p.decision === "rejected"
+                      ? "PLAN_REJECTED"
+                      : "PLAN_REVISION";
+                let approvalMsgText = `${decisionEmoji} **${decisionLabel}** — ${plan.summary}`;
+                if (p.reason) approvalMsgText += `\n\nReason: ${p.reason}`;
+                if (p.step_comments?.length) {
+                  approvalMsgText += `\n\nStep comments (${p.step_comments.length}):`;
+                  for (const sc of p.step_comments) {
+                    approvalMsgText += `\n  Step ${sc.step_order}: ${sc.comment}`;
+                  }
+                }
+                sendMessageToNAS(
+                  cfg,
+                  approvalTask.channel_id,
+                  approvalMsgText,
+                  msgType,
+                  [approvalTask.to],
+                  undefined,
+                  {
+                    task_id: p.task_id,
+                    plan_id: plan.plan_id,
+                    decision: p.decision,
+                    reason: p.reason ?? null,
+                  },
+                );
+              }
+
               return {
                 content: [
                   {
@@ -4850,6 +4892,41 @@ const agentChatroomPlugin = {
               total_steps: plan.steps.length,
               current_phase: "plan_created",
             } as Partial<TaskRecord>);
+
+            // Send plan to DM channel so it's visible in chat
+            const taskRecord = readTaskRecord(cfg, p.task_id);
+            if (taskRecord) {
+              const stepsText = plan.steps
+                .map(
+                  (s: any) =>
+                    `${s.order}. **${s.title}** (~${s.estimated_minutes}min)\n   ${s.description}`,
+                )
+                .join("\n");
+              const planMsgText =
+                `📋 **Execution Plan** — ${plan.summary}\n\n` +
+                `${stepsText}\n\n` +
+                `Estimated total: ~${plan.estimated_total_minutes} min · ` +
+                `${plan.steps.length} steps · ` +
+                `Approval: ${approvalMode === "human" ? "Human required" : "Orchestrator can decide"}`;
+              sendMessageToNAS(
+                cfg,
+                taskRecord.channel_id,
+                planMsgText,
+                "PLAN_CREATED",
+                [taskRecord.from],
+                undefined,
+                {
+                  task_id: p.task_id,
+                  plan_id: plan.plan_id,
+                  plan_status: plan.status,
+                  plan_summary: plan.summary,
+                  plan_steps: plan.steps,
+                  estimated_total_minutes: plan.estimated_total_minutes,
+                  approval_mode: approvalMode,
+                },
+              );
+            }
+
             return {
               content: [
                 {
