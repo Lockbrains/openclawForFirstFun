@@ -83,6 +83,12 @@ interface ProgressEntry {
 
 type ResumeStrategy = "continue" | "restart" | "wait_and_check";
 
+interface ExpectedDeliverables {
+  required_extensions?: string[];
+  exclude_extensions?: string[];
+  description?: string;
+}
+
 interface TaskRecord {
   task_id: string;
   from: string;
@@ -108,6 +114,7 @@ interface TaskRecord {
   current_step?: number | null;
   total_steps?: number | null;
   resume_strategy?: ResumeStrategy;
+  expected_deliverables?: ExpectedDeliverables;
 }
 
 // ── Plan Mode types ──────────────────────────────────────────────────────────
@@ -142,6 +149,7 @@ interface PlanStep {
   timeout_minutes: number;
   result_summary: string | null;
   output_files: string[];
+  is_final_deliverable: boolean;
   started_at: string | null;
   completed_at: string | null;
   error_detail: string | null;
@@ -379,6 +387,7 @@ function createNewPlan(
     | "status"
     | "result_summary"
     | "output_files"
+    | "is_final_deliverable"
     | "started_at"
     | "completed_at"
     | "error_detail"
@@ -406,6 +415,7 @@ function createNewPlan(
       ),
       result_summary: null,
       output_files: [],
+      is_final_deliverable: false,
       started_at: null,
       completed_at: null,
       error_detail: null,
@@ -1959,6 +1969,7 @@ function createTaskRecord(
     taskTimeoutMs?: number;
     maxRetries?: number;
     resumeStrategy?: ResumeStrategy;
+    expectedDeliverables?: ExpectedDeliverables;
   },
 ): TaskRecord {
   const dir = tasksDir(cfg);
@@ -1982,6 +1993,7 @@ function createTaskRecord(
     ack_timeout_ms: opts?.ackTimeoutMs ?? 60_000,
     task_timeout_ms: opts?.taskTimeoutMs ?? 3_600_000,
     resume_strategy: getResumeStrategy(to, opts?.resumeStrategy),
+    expected_deliverables: inferExpectedDeliverables(to, instruction, opts?.expectedDeliverables),
   };
 
   writeJson(path.join(dir, `${task.task_id}.json`), task);
@@ -2048,6 +2060,50 @@ function validateMessageIdentity(cfg: ChatroomConfig, msg: InboxMessage, logger:
   return true;
 }
 
+// ── Per-agent expected deliverable defaults ─────────────────────────────────
+
+const AGENT_DEFAULT_DELIVERABLES: Record<string, ExpectedDeliverables> = {
+  art: {
+    required_extensions: [".png", ".jpg", ".jpeg", ".webp", ".psd", ".tiff", ".svg"],
+    exclude_extensions: [".md", ".txt"],
+    description: "image/visual asset files",
+  },
+  audio: {
+    required_extensions: [".wav", ".mp3", ".ogg", ".flac", ".aac", ".m4a"],
+    exclude_extensions: [".md", ".txt"],
+    description: "audio files",
+  },
+  git: {
+    required_extensions: [".zip", ".tar", ".gz"],
+    description: "build artifacts / packages",
+  },
+};
+
+function inferExpectedDeliverables(
+  agentId: string,
+  instruction: string,
+  explicit?: ExpectedDeliverables,
+): ExpectedDeliverables | undefined {
+  if (explicit) return explicit;
+  const defaults = AGENT_DEFAULT_DELIVERABLES[agentId];
+  if (defaults) return defaults;
+  // Infer from instruction keywords
+  const lower = instruction.toLowerCase();
+  const wantsVisual =
+    ["generate", "render", "create", "draw", "produce", "design"].some((k) => lower.includes(k)) &&
+    ["image", "picture", "sprite", "icon", "texture", "render", "photo", "illustration"].some((k) =>
+      lower.includes(k),
+    );
+  if (wantsVisual) {
+    return {
+      required_extensions: [".png", ".jpg", ".jpeg", ".webp", ".psd", ".svg"],
+      exclude_extensions: [".md", ".txt"],
+      description: "image/visual asset files",
+    };
+  }
+  return undefined;
+}
+
 const AGENT_DEFAULT_RESUME_STRATEGY: Record<string, ResumeStrategy> = {
   art: "continue",
   audio: "continue",
@@ -2072,6 +2128,7 @@ function dispatchTask(
     longRunning?: boolean;
     humanApprovalRequired?: boolean;
     resumeStrategy?: ResumeStrategy;
+    expectedDeliverables?: ExpectedDeliverables;
   },
 ): TaskRecord {
   const channelId = `dm_${to}`;
@@ -2096,6 +2153,7 @@ function dispatchTask(
     session_nonce: sessionNonce,
     human_approval_required: opts?.humanApprovalRequired ?? false,
     resume_strategy: task.resume_strategy,
+    expected_deliverables: task.expected_deliverables,
   });
 
   updateTaskRecord(cfg, task.task_id, {
@@ -2130,6 +2188,55 @@ function sendSystemAck(
   );
 }
 
+/**
+ * Filter asset paths based on expected_deliverables contract.
+ * Separates final deliverables from intermediate artifacts.
+ */
+function filterDeliverables(
+  allPaths: string[],
+  expected: ExpectedDeliverables | undefined,
+  logger: Logger,
+  taskId: string,
+): { deliverables: string[]; intermediates: string[] } {
+  if (!expected) return { deliverables: allPaths, intermediates: [] };
+
+  const deliverables: string[] = [];
+  const intermediates: string[] = [];
+
+  for (const p of allPaths) {
+    const ext = path.extname(p).toLowerCase();
+
+    if (expected.exclude_extensions?.includes(ext)) {
+      intermediates.push(p);
+      continue;
+    }
+
+    deliverables.push(p);
+  }
+
+  // Validate: if required_extensions specified, at least one must be present
+  if (expected.required_extensions && expected.required_extensions.length > 0) {
+    const hasRequired = deliverables.some((p) =>
+      expected.required_extensions!.includes(path.extname(p).toLowerCase()),
+    );
+    if (!hasRequired && deliverables.length > 0) {
+      logger.warn(
+        `[delivery] Task ${taskId}: no files matching required extensions ` +
+          `${expected.required_extensions.join(",")} — expected: ${expected.description ?? "required assets"}`,
+      );
+    }
+  }
+
+  if (intermediates.length > 0) {
+    logger.info(
+      `[delivery] Task ${taskId}: filtered ${intermediates.length} intermediate file(s) from deliverables: ` +
+        intermediates.map((p) => path.basename(p)).join(", "),
+    );
+  }
+
+  return { deliverables, intermediates };
+}
+
 function sendTaskResult(
   cfg: ChatroomConfig,
   taskId: string,
@@ -2146,7 +2253,15 @@ function sendTaskResult(
     logger.warn(`Cannot send result — task ${taskId} not found`);
     return;
   }
-  const uriAssetPaths = assetPaths.map((p) => toChatroomUri(p, cfg));
+
+  // Programmatic filter: separate deliverables from intermediate artifacts
+  const { deliverables } = filterDeliverables(
+    assetPaths,
+    task.expected_deliverables,
+    logger,
+    taskId,
+  );
+  const uriAssetPaths = deliverables.map((p) => toChatroomUri(p, cfg));
 
   // Workers send DELIVERED (not DONE). Only the orchestrator can close a task after review.
   const reportStatus = status === "DONE" ? "DELIVERED" : status;
@@ -3518,12 +3633,68 @@ async function autoDispatchMessage(
       assetPaths.length > 0
         ? `\nDelivered files:\n${assetPaths.map((p) => `  • ${p}`).join("\n")}`
         : "\n(No files delivered)";
+
+    // Detect if the original task likely expected visual/binary deliverables
+    const taskRecord = taskId ? readTaskRecord(chatroomCfg, taskId) : null;
+    const instruction = taskRecord?.instruction?.toLowerCase() ?? "";
+    const VISUAL_KEYWORDS = [
+      "generate",
+      "render",
+      "create",
+      "draw",
+      "design",
+      "produce",
+      "make",
+      "build",
+    ];
+    const VISUAL_ASSET_KEYWORDS = [
+      "image",
+      "picture",
+      "sprite",
+      "icon",
+      "texture",
+      "model",
+      "audio",
+      "sound",
+      "music",
+      "video",
+      "animation",
+      "file",
+      "asset",
+    ];
+    const expectsVisualAssets =
+      VISUAL_KEYWORDS.some((k) => instruction.includes(k)) &&
+      VISUAL_ASSET_KEYWORDS.some((k) => instruction.includes(k));
+    const IMAGE_EXTS = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".psd", ".tiff"];
+    const BINARY_EXTS = [
+      ...IMAGE_EXTS,
+      ".wav",
+      ".mp3",
+      ".ogg",
+      ".fbx",
+      ".glb",
+      ".gltf",
+      ".obj",
+      ".blend",
+      ".zip",
+    ];
+    const hasBinaryAssets = assetPaths.some((p) =>
+      BINARY_EXTS.some((ext) => p.toLowerCase().endsWith(ext)),
+    );
+    const deliveryWarning =
+      expectsVisualAssets && !hasBinaryAssets
+        ? `\n\n🚨 WARNING: The original instruction appears to request visual/binary deliverables ` +
+          `(keywords: ${VISUAL_KEYWORDS.filter((k) => instruction.includes(k)).join(", ")}), ` +
+          `but ONLY text/document files were delivered. ` +
+          `You should REJECT this result and ask the agent to produce the actual assets, not just documentation.`
+        : "";
+
     messageBody =
       `[RESULT_REPORT from ${senderLabel}] Task ${taskId ?? "unknown"}${assetSection}\n\n` +
       `${msg.content.text}\n\n` +
       `⚠️ ACTION REQUIRED: Review the deliverables above. ` +
       `Use chatroom_list_assets to verify files exist, then call chatroom_close_task(task_id="${taskId}", verdict="accepted") ` +
-      `to close, or verdict="rejected" with a comment to request rework.`;
+      `to close, or verdict="rejected" with a comment to request rework.${deliveryWarning}`;
   } else {
     messageBody = `[Chatroom #${channelId}] ${senderLabel}: ${msg.content.text}`;
   }
@@ -3617,6 +3788,19 @@ async function planningPhase(
     peer: { kind: isDM ? "direct" : "group", id: channelId },
   });
 
+  // Build deliverables context so the agent knows what's expected
+  const taskRecord = readTaskRecord(chatroomCfg, taskId);
+  const expectedDel = taskRecord?.expected_deliverables;
+  const deliverableContext = expectedDel
+    ? `\nEXPECTED DELIVERABLES: ${expectedDel.description ?? "see extensions below"}` +
+      (expectedDel.required_extensions?.length
+        ? `\n  Required file types: ${expectedDel.required_extensions.join(", ")}`
+        : "") +
+      (expectedDel.exclude_extensions?.length
+        ? `\n  Excluded from delivery: ${expectedDel.exclude_extensions.join(", ")} (these are filtered out automatically)`
+        : "")
+    : "";
+
   const planningPrompt = [
     `[CHATROOM TASK — PLANNING PHASE]`,
     `task_id: ${taskId}`,
@@ -3624,6 +3808,7 @@ async function planningPhase(
     ``,
     `INSTRUCTION:`,
     msg.content.text,
+    deliverableContext,
     ``,
     `You are in PLANNING MODE. Do NOT execute the task yet.`,
     `Analyze the instruction and create a structured execution plan.`,
@@ -3643,6 +3828,15 @@ async function planningPhase(
     `  - Steps for builds/uploads/deployments should have higher timeout_minutes`,
     `  - Keep descriptions specific and actionable`,
     `  - After calling chatroom_create_plan, respond with a brief confirmation`,
+    ``,
+    `CRITICAL — Deliverable-first planning:`,
+    `  - Before creating your plan, identify the FINAL DELIVERABLE the downstream consumer needs.`,
+    `  - Your last step MUST produce the actual deliverable files (not documentation about them).`,
+    `  - Intermediate notes, briefs, or plans are useful for YOUR process but are NOT deliverables.`,
+    `  - Text-only documentation (*.md, *.txt) is automatically excluded from delivery when the task`,
+    `    expects visual/binary output. Only actual asset files will be delivered to the requester.`,
+    `  - Example: if asked to "generate an image", your plan must include a step that actually`,
+    `    generates the image file — writing a description of the image is NOT a valid deliverable.`,
   ].join("\n");
 
   const ctxPayload = runtime.channel.reply.finalizeInboundContext({
@@ -3886,7 +4080,21 @@ async function stepExecutionLoop(
 
   // All steps completed
   updatePlan(chatroomCfg, taskId, { status: "COMPLETED", completed_at: nowISO() });
-  const allFiles = scanOutputDir(outputDir as string);
+
+  // Prefer files explicitly tagged as deliverables by the agent.
+  // Fall back to scanOutputDir if no files were tagged (backward compat).
+  const updatedPlan = readPlan(chatroomCfg, taskId);
+  const taggedDeliverables: string[] = [];
+  if (updatedPlan) {
+    for (const s of updatedPlan.steps) {
+      if ((s as any).is_final_deliverable && s.output_files?.length) {
+        taggedDeliverables.push(...s.output_files);
+      }
+    }
+  }
+  const allFiles =
+    taggedDeliverables.length > 0 ? taggedDeliverables : scanOutputDir(outputDir as string);
+
   const resultSummary = [
     `Plan completed: ${plan.summary}`,
     ``,
@@ -3931,6 +4139,21 @@ async function executeStep(
         previousResults.map((r, i) => `  Step ${i + 1} (${r.title}): ${r.result}`).join("\n")
       : "";
 
+  const isLastStep = step.order === plan.steps.length;
+  const taskInstruction = originalMsg.content.text.toLowerCase();
+  const looksVisual =
+    ["generate", "render", "create", "draw", "produce"].some((k) => taskInstruction.includes(k)) &&
+    ["image", "picture", "sprite", "icon", "texture", "render", "asset"].some((k) =>
+      taskInstruction.includes(k),
+    );
+  const finalStepReminder =
+    isLastStep && looksVisual
+      ? `\n\nCRITICAL: This is the FINAL step. The original task asks for visual/rendered output. ` +
+        `You MUST produce actual image files (not just documentation/plans). ` +
+        `Use your image generation capabilities and call chatroom_publish_file to deliver the rendered asset. ` +
+        `Text-only deliverables will be REJECTED.`
+      : "";
+
   const stepPrompt = [
     `[CHATROOM TASK — STEP EXECUTION]`,
     `task_id: ${taskId}`,
@@ -3953,11 +4176,16 @@ async function executeStep(
     `2. Use chatroom_publish_file for binary files, chatroom_save_asset for text content.`,
     `3. When done, call chatroom_complete_step(task_id="${taskId}", step_id="${step.step_id}",`,
     `   result_summary="...", output_files=[...]) to mark this step complete.`,
-    `4. If you encounter an unrecoverable error, call chatroom_fail_step(task_id="${taskId}",`,
+    `4. Set is_final_deliverable=true in chatroom_complete_step ONLY when this step produces the`,
+    `   actual files that the task requester needs. Intermediate notes/documentation are NOT deliverables.`,
+    `5. If you encounter an unrecoverable error, call chatroom_fail_step(task_id="${taskId}",`,
     `   step_id="${step.step_id}", error_detail="...").`,
-    `5. For long-running operations, use chatroom_task_park.`,
-    `6. SENSITIVE OPERATIONS require chatroom_request_permission.`,
-    `7. DO NOT send messages to other channels or agents.`,
+    `6. For long-running operations, use chatroom_task_park.`,
+    `7. SENSITIVE OPERATIONS require chatroom_request_permission.`,
+    `8. DO NOT send messages to other channels or agents.`,
+    `9. When the original instruction asks for visual output (images, renders), you MUST actually`,
+    `   generate/render the visual asset — NOT just a text description of how to do it.`,
+    finalStepReminder,
   ].join("\n");
 
   const ctxPayload = runtime.channel.reply.finalizeInboundContext({
@@ -4123,6 +4351,28 @@ async function autoDispatchForTask(
     : taskAssetsDir(chatroomCfg, chatroomCfg.agentId, taskId);
   ensureDir(outputDir);
 
+  // Surface expected deliverables so the agent knows what to produce
+  const metaDeliverables = msg.metadata?.expected_deliverables as ExpectedDeliverables | undefined;
+  const taskRecord = readTaskRecord(chatroomCfg, taskId);
+  const expectedDel = metaDeliverables ?? taskRecord?.expected_deliverables;
+  const deliverableHint = expectedDel
+    ? [
+        ``,
+        `EXPECTED DELIVERABLES:`,
+        `  ${expectedDel.description ?? "See file type constraints below."}`,
+        ...(expectedDel.required_extensions?.length
+          ? [`  Required file types: ${expectedDel.required_extensions.join(", ")}`]
+          : []),
+        ...(expectedDel.exclude_extensions?.length
+          ? [
+              `  Auto-excluded from delivery: ${expectedDel.exclude_extensions.join(", ")} (intermediate artifacts)`,
+            ]
+          : []),
+        `  IMPORTANT: Only files matching the required types will be delivered to the requester.`,
+        `  Documentation, plans, and notes are for YOUR process only — they are NOT deliverables.`,
+      ].join("\n")
+    : "";
+
   const taskContext = [
     `[CHATROOM TASK — STRICT PROTOCOL]`,
     `task_id: ${taskId}`,
@@ -4131,6 +4381,7 @@ async function autoDispatchForTask(
     ``,
     `INSTRUCTION:`,
     msg.content.text,
+    deliverableHint,
     ``,
     `RULES (MUST follow — violations break the task protocol):`,
     `1. FILE SHARING PROTOCOL — choose the right tool:`,
@@ -4389,6 +4640,33 @@ const agentChatroomPlugin = {
                   "Defaults based on target agent (art/audio=continue, git=wait_and_check, else=restart).",
               }),
             ),
+            expected_deliverables: Type.Optional(
+              Type.Object(
+                {
+                  required_extensions: Type.Optional(
+                    Type.Array(Type.String(), {
+                      description: 'File extensions the task MUST deliver (e.g. [".png", ".wav"])',
+                    }),
+                  ),
+                  exclude_extensions: Type.Optional(
+                    Type.Array(Type.String(), {
+                      description: "File extensions to automatically exclude from delivery",
+                    }),
+                  ),
+                  description: Type.Optional(
+                    Type.String({
+                      description: 'Human-readable description (e.g. "rendered image files")',
+                    }),
+                  ),
+                },
+                {
+                  description:
+                    "Declare expected deliverable file types. If omitted, defaults are inferred " +
+                    "from the target agent and instruction keywords. Intermediate artifacts " +
+                    "(plans, notes, docs) matching exclude_extensions are automatically filtered out.",
+                },
+              ),
+            ),
           }),
           async execute(_toolCallId, params) {
             try {
@@ -4398,6 +4676,7 @@ const agentChatroomPlugin = {
                 timeout_minutes?: number;
                 long_running?: boolean;
                 resume_strategy?: ResumeStrategy;
+                expected_deliverables?: ExpectedDeliverables;
               };
               const timeoutMs = (p.timeout_minutes ?? 60) * 60_000;
               let instruction = p.instruction;
@@ -4412,6 +4691,7 @@ const agentChatroomPlugin = {
                 taskTimeoutMs: timeoutMs,
                 longRunning: p.long_running,
                 resumeStrategy: p.resume_strategy,
+                expectedDeliverables: p.expected_deliverables,
               });
               return {
                 content: [
@@ -4424,8 +4704,13 @@ const agentChatroomPlugin = {
                       `  timeout: ${p.timeout_minutes ?? 60} minutes\n` +
                       `  long_running: ${p.long_running ?? false}\n` +
                       `  resume_strategy: ${task.resume_strategy}\n` +
+                      `  expected_deliverables: ${task.expected_deliverables?.description ?? "auto-inferred"}\n` +
                       `  status: DISPATCHED (awaiting ACK)\n` +
-                      `The system will auto-retry if ${p.target} doesn't respond.`,
+                      `The system will auto-retry if ${p.target} doesn't respond.\n` +
+                      (task.expected_deliverables
+                        ? `Note: intermediate artifacts (${task.expected_deliverables.exclude_extensions?.join(", ") ?? "none"}) ` +
+                          `will be automatically filtered from the final delivery.`
+                        : ""),
                   },
                 ],
                 details: task,
@@ -4917,12 +5202,7 @@ const agentChatroomPlugin = {
 
           // ── [RAG][QUERY] report ──
           try {
-            sendMessageToNAS(
-              cfg,
-              reportChannel,
-              `[RAG][QUERY] ${p.query}`,
-              "STATUS_UPDATE",
-            );
+            sendMessageToNAS(cfg, reportChannel, `[RAG][QUERY] ${p.query}`, "STATUS_UPDATE");
           } catch (e) {
             logger.warn(`RAG report (QUERY) failed: ${e}`);
           }
@@ -4983,9 +5263,10 @@ const agentChatroomPlugin = {
             }
 
             // ── [RAG][RESPONSE] report (includes strategy) ──
-            const sourceSummary = sources.length > 0
-              ? sources.map((s, i) => `[${i + 1}] ${s.source || "unknown"}`).join(", ")
-              : "none";
+            const sourceSummary =
+              sources.length > 0
+                ? sources.map((s, i) => `[${i + 1}] ${s.source || "unknown"}`).join(", ")
+                : "none";
             try {
               sendMessageToNAS(
                 cfg,
@@ -6192,15 +6473,26 @@ const agentChatroomPlugin = {
         description:
           "Mark a plan step as completed and provide a result summary.\n" +
           "Call this after finishing each step during plan execution.\n\n" +
+          "IMPORTANT: Set is_final_deliverable=true ONLY for files that are the actual task output\n" +
+          "that downstream consumers need. Intermediate notes, plans, and documentation are NOT deliverables.\n\n" +
           "Example:\n" +
           '  chatroom_complete_step(task_id="abc", step_id="xyz",\n' +
-          '    result_summary="All 42 tests passed", output_files=["/workspace/out/test-report.txt"])',
+          '    result_summary="Rendered hero image", output_files=["render.png"], is_final_deliverable=true)',
         parameters: Type.Object({
           task_id: Type.String({ description: "The task ID" }),
           step_id: Type.String({ description: "The step ID to mark as completed" }),
           result_summary: Type.String({ description: "Brief summary of what was accomplished" }),
           output_files: Type.Optional(
             Type.Array(Type.String(), { description: "Paths to files produced by this step" }),
+          ),
+          is_final_deliverable: Type.Optional(
+            Type.Boolean({
+              description:
+                "Set to true if this step's output_files are FINAL DELIVERABLES for the task " +
+                "(actual assets the requester needs). Leave false/omit for intermediate artifacts " +
+                "like notes, briefs, specs, or plans. Only deliverable files are included in the " +
+                "task result sent to the requester.",
+            }),
           ),
         }),
         async execute(_toolCallId, params) {
@@ -6210,13 +6502,15 @@ const agentChatroomPlugin = {
               step_id: string;
               result_summary: string;
               output_files?: string[];
+              is_final_deliverable?: boolean;
             };
             const plan = updatePlanStep(cfg, p.task_id, p.step_id, {
               status: "COMPLETED",
               result_summary: p.result_summary,
               output_files: p.output_files ?? [],
               completed_at: nowISO(),
-            });
+              is_final_deliverable: p.is_final_deliverable ?? false,
+            } as any);
             if (!plan) {
               return {
                 content: [{ type: "text" as const, text: `Plan not found for task ${p.task_id}` }],
