@@ -4370,18 +4370,29 @@ async function stepExecutionLoop(
       detail: step.title,
     });
 
-    const result = await executeStep(
-      chatroomCfg,
-      plan,
-      step,
-      taskId,
-      outputDir as string,
-      previousResults,
-      msg,
-      runtime,
-      config,
-      logger,
-    );
+    let result: StepResult;
+    try {
+      result = await executeStep(
+        chatroomCfg,
+        plan,
+        step,
+        taskId,
+        outputDir as string,
+        previousResults,
+        msg,
+        runtime,
+        config,
+        logger,
+      );
+    } catch (err: any) {
+      const errMsg = err?.message ?? String(err);
+      result = {
+        success: false,
+        result_summary: "",
+        output_files: [],
+        error_detail: `Unhandled error during step execution: ${errMsg}`,
+      };
+    }
 
     if (result.success) {
       previousResults.push({ title: step.title, result: result.result_summary });
@@ -4564,6 +4575,8 @@ async function executeStep(
     output_files: [],
     error_detail: "Step did not complete",
   };
+  /** Last tool/block activity — used to explain "Step did not complete" when agent never called complete_step/fail_step */
+  let lastActivityDetail: string | null = null;
 
   const dispatcherOptions = {
     responsePrefix: prefixContext.responsePrefix,
@@ -4573,17 +4586,21 @@ async function executeStep(
       const kind = info?.kind ?? "final";
 
       if (kind === "tool") {
+        const detail = text.slice(0, 200);
+        lastActivityDetail = detail;
         appendTaskProgress(chatroomCfg, taskId, {
           phase: `step_${step.order}_tool`,
-          detail: text.slice(0, 200),
+          detail,
         });
         return;
       }
 
       if (kind === "block") {
+        const detail = text.slice(0, 200);
+        lastActivityDetail = detail;
         appendTaskProgress(chatroomCfg, taskId, {
           phase: `step_${step.order}_progress`,
-          detail: text.slice(0, 200),
+          detail,
         });
         return;
       }
@@ -4654,16 +4671,42 @@ async function executeStep(
     `Dispatching step ${step.order} to LLM (timeout: ${Math.round(stepTimeoutMs / 60000)}min)`,
   );
 
-  await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
-    ctx: ctxPayload,
-    cfg: config,
-    dispatcherOptions,
-    replyOptions: {
-      onModelSelected: prefixContext.onModelSelected,
-      toolsDeny: ["message", "feishu_*", "lark_*"],
-      agentTimeoutMs: stepTimeoutMs,
-    },
-  });
+  try {
+    await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+      ctx: ctxPayload,
+      cfg: config,
+      dispatcherOptions,
+      replyOptions: {
+        onModelSelected: prefixContext.onModelSelected,
+        toolsDeny: ["message", "feishu_*", "lark_*"],
+        agentTimeoutMs: stepTimeoutMs,
+      },
+    });
+  } catch (err: any) {
+    // Timeout, LLM throw, or dispatcher rejection — capture real reason for frontend
+    const errMsg = err?.message ?? String(err);
+    stepResult = {
+      success: false,
+      result_summary: "",
+      output_files: [],
+      error_detail:
+        errMsg.includes("timeout") || errMsg.includes("timed out")
+          ? `Step timed out after ${step.timeout_minutes}min. ${errMsg}`
+          : `Step execution error: ${errMsg}`,
+    };
+  }
+
+  // If we still have the generic "Step did not complete", explain why (no complete_step/fail_step; last activity)
+  if (!stepResult.success && stepResult.error_detail === "Step did not complete") {
+    stepResult = {
+      ...stepResult,
+      error_detail:
+        "Agent did not call chatroom_complete_step or chatroom_fail_step before the run ended. " +
+        (lastActivityDetail
+          ? `Last activity: ${lastActivityDetail}`
+          : "No tool or block output was recorded (possible timeout or empty response)."),
+    };
+  }
 
   return stepResult;
 }
