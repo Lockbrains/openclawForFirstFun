@@ -3496,7 +3496,11 @@ function monitorPendingTasks(cfg: ChatroomConfig, logger: Logger): void {
 // Orchestration context
 // ============================================================================
 
-function buildOrchestratorContext(cfg: ChatroomConfig, sourceChannel?: string): string {
+function buildOrchestratorContext(
+  cfg: ChatroomConfig,
+  sourceChannel?: string,
+  currentMessageHumanApproval?: boolean,
+): string {
   const agents = readAgentRegistry(cfg);
   const channels = listAgentChannels(cfg);
 
@@ -3579,6 +3583,18 @@ function buildOrchestratorContext(cfg: ChatroomConfig, sourceChannel?: string): 
   lines.push(
     `  Human approval: pass human_approval_required: true ONLY when the user explicitly used /human; otherwise plans are auto-approved. Sensitive ops use #permission.`,
   );
+  // Explicit per-message signal so the orchestrator does not claim "/human mode" when the user did not use /human
+  if (currentMessageHumanApproval === true) {
+    lines.push(``);
+    lines.push(
+      `  [CURRENT MESSAGE] This user message was sent WITH /human. You may pass human_approval_required: true when dispatching and may mention that plans will be submitted for human review.`,
+    );
+  } else {
+    lines.push(``);
+    lines.push(
+      `  [CURRENT MESSAGE] This user message was NOT sent with /human. Do NOT say that the system is in "/human mode" or that plans will be submitted for review. Plans are auto-approved. Do not pass human_approval_required: true when dispatching for this request.`,
+    );
+  }
   lines.push(``);
   lines.push(`═══ RAG (Project Knowledge) — MANDATORY ═══`);
   lines.push(`  Use rag_query(query="...") to retrieve project context from the RAG system.`);
@@ -3619,7 +3635,7 @@ function buildOrchestratorContext(cfg: ChatroomConfig, sourceChannel?: string): 
   lines.push(`  You then route the question to the appropriate agent for an answer.`);
   lines.push(`  Use chatroom_list_plans to monitor plan progress.`);
   lines.push(
-    `  When a /human command is active, plans require human approval via the Web dashboard.`,
+    `  Human approval for plans happens ONLY when you passed human_approval_required: true in chatroom_dispatch_task (i.e. when the user used /human). Otherwise plans are auto-approved.`,
   );
   lines.push(``);
 
@@ -3715,12 +3731,18 @@ function buildWorkerContext(cfg: ChatroomConfig, sourceChannel?: string): string
     `  To access files from other agents, resolve their chatroom:// URI with your own NAS root.`,
     sourceChannel ? `  Current channel: #${sourceChannel}` : ``,
     ``,
-    `═══ RAG (Project Knowledge) — MANDATORY ═══`,
-    `  BEFORE starting any task, query the RAG system for project context:`,
+    `═══ RAG vs TOOLS.md — DO NOT CONFUSE ═══`,
+    `  RAG = project-specific knowledge (design docs, specs, prior decisions, game features). Use rag_query for that.`,
+    `  TOOLS.md + your registered tools = what you CAN do and HOW (e.g. release branch, release notes, shell, read/write).`,
+    `  RAG does NOT contain everything. Many procedures and capabilities are in TOOLS.md.`,
+    `  Do NOT conclude "I cannot do this task" just because RAG did not return repo URL, template, or version.`,
+    `  Use your tools (shell, read workspace, etc.) and TOOLS.md first; only say you cannot when both RAG and TOOLS don't cover it.`,
+    ``,
+    `═══ RAG (Project Knowledge) — USE FOR FACTS ═══`,
+    `  BEFORE starting any task, query RAG for relevant project context:`,
     `    rag_query(query="relevant question about the project")`,
-    `  The RAG is the single source of truth for project knowledge.`,
-    `  ALWAYS query RAG — never rely on prior conversation context for project facts.`,
-    `  If RAG is unavailable, state this clearly and do NOT guess project details.`,
+    `  Use RAG for project facts. If RAG is unavailable, state that and proceed using TOOLS.md and your tools.`,
+    `  Do NOT refuse to execute a task solely because RAG lacked some detail — your capabilities are in TOOLS.md.`,
     ``,
     `═══ File Sharing Protocol ═══`,
     `  Binary files (images, audio, PDFs, models):`,
@@ -3745,9 +3767,13 @@ function buildWorkerContext(cfg: ChatroomConfig, sourceChannel?: string): string
   return lines.join("\n");
 }
 
-function buildChatroomContext(cfg: ChatroomConfig, sourceChannel?: string): string {
+function buildChatroomContext(
+  cfg: ChatroomConfig,
+  sourceChannel?: string,
+  currentMessageHumanApproval?: boolean,
+): string {
   if (cfg.role === "orchestrator") {
-    return buildOrchestratorContext(cfg, sourceChannel);
+    return buildOrchestratorContext(cfg, sourceChannel, currentMessageHumanApproval);
   }
   return buildWorkerContext(cfg, sourceChannel);
 }
@@ -3787,7 +3813,8 @@ async function autoDispatchMessage(
     ? `[Human] ${msg.from.slice("human:".length)}`
     : msg.from;
 
-  const chatroomContext = buildChatroomContext(chatroomCfg, channelId);
+  const currentMessageHumanApproval = msg.metadata?.human_approval_required === true;
+  const chatroomContext = buildChatroomContext(chatroomCfg, channelId, currentMessageHumanApproval);
 
   // If this is a RESULT_REPORT to the orchestrator, add a review prompt
   let messageBody: string;
@@ -4081,6 +4108,7 @@ async function planningPhase(
   if (toolsMdText) {
     planningPromptParts.push(
       `═══ YOUR TOOLS (TOOLS.md from default workspace — your capabilities and how to use them) ═══`,
+      `CRITICAL: Your capabilities (e.g. release branch, release notes) are defined here. Do NOT refuse to plan or execute because RAG did not return repo URL or template — use your tools and this TOOLS.md.`,
       toolsMdText,
       ``,
     );
@@ -4127,6 +4155,7 @@ async function planningPhase(
     `  - Each step should produce a verifiable outcome`,
     `  - Steps for builds/uploads/deployments should have higher timeout_minutes`,
     `  - Keep descriptions specific and actionable`,
+    `  - Do NOT refuse to plan because RAG lacked repo URL, template, or version — TOOLS.md defines your capabilities; use workspace and shell as needed`,
     `  - After calling chatroom_create_plan, respond with a brief confirmation`,
     ``,
     `CRITICAL — Deliverable-first planning:`,
