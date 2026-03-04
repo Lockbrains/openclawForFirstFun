@@ -3592,7 +3592,7 @@ function buildOrchestratorContext(
   } else {
     lines.push(``);
     lines.push(
-      `  [CURRENT MESSAGE] This user message was NOT sent with /human. Do NOT say that the system is in "/human mode" or that plans will be submitted for review. Plans are auto-approved. Do not pass human_approval_required: true when dispatching for this request.`,
+      `  [CURRENT MESSAGE] This user message was NOT sent with /human. You MUST NOT say "当前处于 /human 模式" or "提交计划供审核" or that the Agent will submit the plan for review. Plans are auto-approved. Do not pass human_approval_required: true when dispatching for this request.`,
     );
   }
   lines.push(``);
@@ -6876,7 +6876,10 @@ const agentChatroomPlugin = {
                 timeout_minutes?: number;
               }[];
             };
-            const approvalMode = getApprovalMode(cfg);
+            // Plan approval mode must match actual behavior: only /human (task.human_approval_required) triggers human approval
+            const taskForPlan = readTaskRecord(cfg, p.task_id);
+            const approvalMode =
+              (taskForPlan as any)?.human_approval_required === true ? "human" : "orchestrator";
             const plan = createNewPlan(
               cfg,
               p.task_id,
