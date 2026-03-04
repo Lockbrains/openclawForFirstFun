@@ -2363,6 +2363,9 @@ function sendTaskResult(
   };
   if (errorType) {
     patch.error_type = errorType;
+  }
+  // Always persist failure detail for debugging (frontend shows this in Failed task modal)
+  if (status === "FAILED") {
     patch.error_detail = resultText.slice(0, 2000);
   }
   patch.current_phase = status === "FAILED" ? "failed" : "delivered";
@@ -4383,11 +4386,16 @@ async function stepExecutionLoop(
     if (result.success) {
       previousResults.push({ title: step.title, result: result.result_summary });
     } else {
-      // Step failed — mark remaining as skipped and fail the plan
-      logger.warn(`Step ${step.order} failed: ${result.error_detail}`);
+      // Step failed — record in progress log for frontend, then mark plan failed and send result
+      const errDetail = result.error_detail ?? "Unknown error";
+      logger.warn(`Step ${step.order} failed: ${errDetail}`);
+      appendTaskProgress(chatroomCfg, taskId, {
+        phase: `step_${step.order}_failed`,
+        detail: errDetail,
+      });
       updatePlanStep(chatroomCfg, taskId, step.step_id, {
         status: "FAILED",
-        error_detail: result.error_detail ?? "Unknown error",
+        error_detail: errDetail,
         completed_at: nowISO(),
       });
 
@@ -4402,7 +4410,7 @@ async function stepExecutionLoop(
       updatePlan(chatroomCfg, taskId, { status: "FAILED", completed_at: nowISO() });
 
       const allFiles = scanOutputDir(outputDir as string);
-      const errSummary = `Plan failed at step ${step.order}/${plan.steps.length} (${step.title}): ${result.error_detail}`;
+      const errSummary = `Plan failed at step ${step.order}/${plan.steps.length} (${step.title}): ${errDetail}`;
       sendTaskResult(chatroomCfg, taskId, errSummary, "FAILED", logger, allFiles);
       return;
     }
