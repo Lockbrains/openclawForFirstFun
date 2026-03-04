@@ -5258,7 +5258,7 @@ const agentChatroomPlugin = {
         async execute(_toolCallId, params) {
           const p = params as { query: string; max_results?: number };
           const ragServiceUrl =
-            process.env.RAG_SERVICE_URL || cfg.ragServiceUrl || "http://localhost:8010";
+            process.env.RAG_SERVICE_URL || cfg.ragServiceUrl || "http://localhost:8000";
           const url = `${ragServiceUrl}/query`;
           const reportChannel = resolveReportChannel();
 
