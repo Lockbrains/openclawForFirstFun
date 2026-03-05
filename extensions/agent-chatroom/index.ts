@@ -4392,7 +4392,10 @@ async function planningPhase(
     agentId: route.agentId,
   });
 
-  let planCreated = false;
+  let planCreatedResolve: (() => void) | null = null;
+  const planCreatedPromise = new Promise<void>((resolve) => {
+    planCreatedResolve = resolve;
+  });
 
   appendTaskProgress(chatroomCfg, taskId, { phase: "planning", detail: "Creating execution plan" });
 
@@ -4403,6 +4406,9 @@ async function planningPhase(
       const kind = info?.kind ?? "final";
       if (kind === "tool") {
         const toolName = _extractToolName(payload);
+        if (toolName === "chatroom_create_plan") {
+          planCreatedResolve?.();
+        }
         const rawDetail = (payload.text ?? "").slice(0, 200);
         appendTaskProgress(chatroomCfg, taskId, {
           phase: "planning_tool",
@@ -4410,7 +4416,7 @@ async function planningPhase(
         });
       }
       if (kind === "final") {
-        planCreated = true;
+        planCreatedResolve?.();
       }
     },
     onError: (err: any) => {
@@ -4422,20 +4428,45 @@ async function planningPhase(
     `Starting planning phase for task ${taskId} (timeout: ${PLANNING_TIMEOUT_MS / 1000}s)`,
   );
 
-  await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+  const dispatchPromise = runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
     ctx: ctxPayload,
     cfg: config,
     dispatcherOptions,
     replyOptions: {
       onModelSelected: prefixContext.onModelSelected,
-      toolsDeny: ["message", "feishu_*", "lark_*"],
+      toolsDeny: [
+        "message",
+        "feishu_*",
+        "lark_*",
+        "chatroom_complete_step",
+        "chatroom_fail_step",
+        "chatroom_task_progress",
+        "chatroom_publish_file",
+        "chatroom_publish_and_send",
+        "chatroom_save_asset",
+        "chatroom_task_park",
+        "chatroom_request_permission",
+      ],
       agentTimeoutMs: PLANNING_TIMEOUT_MS,
     },
   });
 
+  // Wait for either: (a) plan created via tool call, or (b) dispatch finishes naturally.
+  // When plan is created, give a short grace period then return immediately — don't let
+  // the LLM continue executing tasks inside the planning dispatch.
+  const PLAN_CREATED_GRACE_MS = 3_000;
+  await Promise.race([
+    dispatchPromise,
+    planCreatedPromise.then(
+      () => new Promise<void>((resolve) => setTimeout(resolve, PLAN_CREATED_GRACE_MS)),
+    ),
+  ]);
+
   const plan = readPlan(chatroomCfg, taskId);
   if (!plan) {
     logger.warn(`Planning phase completed but no plan was created for task ${taskId}`);
+  } else {
+    logger.info(`Plan created for task ${taskId}, returning to handlePlanModeTask for approval`);
   }
   return plan;
 }
@@ -4914,7 +4945,7 @@ async function executeStep(
   );
 
   try {
-    await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+    const dispatchResult = await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
       ctx: ctxPayload,
       cfg: config,
       dispatcherOptions,
@@ -4924,6 +4955,27 @@ async function executeStep(
         agentTimeoutMs: stepTimeoutMs,
       },
     });
+
+    // When LLM returns empty/NO_REPLY, deliver("final") is never called (normalizeReplyPayload
+    // filters it out), so stepResult stays at the initial "Step did not complete". Detect this
+    // via the dispatch result: no final, no block, no tool queued → LLM produced no output.
+    if (
+      stepResult.error_detail === "Step did not complete" &&
+      !stepResult.success &&
+      dispatchResult
+    ) {
+      const c = dispatchResult.counts;
+      const totalQueued = (c?.final ?? 0) + (c?.block ?? 0) + (c?.tool ?? 0);
+      if (totalQueued === 0) {
+        stepResult = {
+          ...stepResult,
+          error_detail:
+            "LLM returned empty or NO_REPLY — no output was produced for this step. " +
+            "This usually means the model's context was too large, the prompt was filtered, " +
+            "or the model declined to respond. Check the agent's session/context size.",
+        };
+      }
+    }
   } catch (err: any) {
     // Timeout, LLM throw, or dispatcher rejection — capture real reason for frontend
     const errMsg = err?.message ?? String(err);
@@ -7276,8 +7328,9 @@ const agentChatroomPlugin = {
                     `  plan_id: ${plan.plan_id}\n` +
                     `  steps: ${plan.steps.length}\n` +
                     `  estimated_total: ${plan.estimated_total_minutes}min\n` +
-                    `  approval_mode: ${approvalMode}\n` +
-                    `  status: DRAFT (awaiting review)`,
+                    `  approval_mode: ${approvalMode}\n\n` +
+                    `STOP — planning phase is complete. Do NOT execute any steps now.\n` +
+                    `The system will approve the plan and invoke you for each step separately.`,
                 },
               ],
               details: plan,
