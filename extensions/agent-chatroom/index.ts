@@ -3735,17 +3735,15 @@ function buildWorkerContext(cfg: ChatroomConfig, sourceChannel?: string): string
     `  3. NEVER dispatch tasks to other agents. Only the orchestrator does that.`,
     `  4. ONLY communicate in your DM channel: #${myDM}.`,
     `  5. Focus entirely on completing the assigned task.`,
-    `  6. BEFORE executing sensitive operations, use chatroom_request_permission.`,
+    `  6. BEFORE executing sensitive operations that are NOT the task objective, use chatroom_request_permission.`,
     ``,
-    `═══ SENSITIVE OPERATIONS (require permission) ═══`,
-    `  You MUST call chatroom_request_permission BEFORE any of these:`,
-    `  - Shell commands that modify files outside the workspace or project directory`,
-    `  - Commands using sudo, rm -rf on system paths, chmod, chown`,
-    `  - Reading or writing .env, credentials, API keys, secrets`,
-    `  - System service operations (systemctl, docker rm/stop, kill)`,
-    `  - Network requests that modify external state (POST/PUT/DELETE to APIs)`,
+    `═══ SENSITIVE OPERATIONS (permission only when OUTSIDE task objective) ═══`,
+    `  Call chatroom_request_permission ONLY for sensitive operations that are NOT the direct goal of the task.`,
+    `  If the task instruction explicitly asks you to do something (e.g. "trigger the release pipeline", "run the build", "call Jenkins"),`,
+    `  that operation is the TASK OBJECTIVE — do NOT request permission; proceed.`,
+    `  Only request permission for operations that are clearly outside the task (e.g. ad-hoc rm -rf, modifying system files, unrelated APIs).`,
+    `  Sensitive types: shell (system dirs, sudo, rm -rf), .env/credentials, systemctl/docker, network mutations to unrelated services.`,
     `  If the operation is allowlisted, it will auto-approve instantly.`,
-    `  Otherwise your session will pause until an admin decides.`,
     ``,
     `═══ File System (NAS) ═══`,
     `  All asset paths use the chatroom:// URI protocol for cross-machine compatibility.`,
@@ -4585,7 +4583,7 @@ async function executeStep(
     `5. If you encounter an unrecoverable error, call chatroom_fail_step(task_id="${taskId}",`,
     `   step_id="${step.step_id}", error_detail="...").`,
     `6. For long-running operations, use chatroom_task_park.`,
-    `7. SENSITIVE OPERATIONS require chatroom_request_permission.`,
+    `7. SENSITIVE OPERATIONS: request permission ONLY when the operation is NOT the task objective. If the step/task is "trigger release pipeline" or "call Jenkins", do NOT request permission — proceed.`,
     `8. DO NOT send messages to other channels or agents.`,
     `9. When the original instruction asks for visual output (images, renders), you MUST actually`,
     `   generate/render the visual asset — NOT just a text description of how to do it.`,
@@ -4845,12 +4843,10 @@ async function autoDispatchForTask(
     `   This saves tokens and prevents context overflow. A new session resumes when done.`,
     `   Example: chatroom_task_park(task_id="${taskId}", watch_type="file", file_path="/output/build.zip",`,
     `     resume_prompt="Build complete. Upload the zip and report results.", max_wait_minutes=30)`,
-    `6. SENSITIVE OPERATIONS require permission. BEFORE executing any of these, call chatroom_request_permission:`,
-    `   - Shell commands modifying system dirs (outside workspace), sudo, rm -rf on system paths`,
-    `   - Reading/writing .env, credentials, API keys, secrets`,
-    `   - System operations (systemctl, docker rm/stop, chmod, chown, kill)`,
-    `   - Network mutations (POST/PUT/DELETE to external APIs)`,
-    `   Example: chatroom_request_permission(task_id="${taskId}", operation_type="shell",`,
+    `6. SENSITIVE OPERATIONS: call chatroom_request_permission ONLY when the operation is NOT the task objective.`,
+    `   If the task is to "trigger the release pipeline" or "call Jenkins", do NOT request permission — proceed.`,
+    `   Only request for: shell (system dirs, sudo, rm -rf), .env/credentials, systemctl/docker, or network to unrelated services.`,
+    `   Example (only when not the task goal): chatroom_request_permission(task_id="${taskId}", operation_type="shell",`,
     `     operation_detail="rm -rf /usr/local/old-sdk", reason="Need to remove old SDK before installing new one",`,
     `     resume_prompt="Old SDK removed. Install the new SDK and continue.")`,
     `7. DO NOT send results via Lark, Feishu, or any other messaging channel.`,
@@ -6822,12 +6818,14 @@ const agentChatroomPlugin = {
         name: "chatroom_request_permission",
         label: "Chatroom: Request Permission",
         description:
-          "Request human admin approval before executing a sensitive operation.\n" +
-          "Use this BEFORE performing any of these operations:\n" +
+          "Request human admin approval before executing a sensitive operation that is NOT the task objective.\n" +
+          "Do NOT call this for operations that are the direct goal of the task (e.g. task says 'trigger release pipeline' and you are triggering it).\n" +
+          "Only use for operations outside the task: shell (system dirs, sudo, rm -rf), .env/credentials, systemctl/docker, network to unrelated APIs.\n\n" +
+          "Use this BEFORE performing such out-of-scope operations:\n" +
           "  - Shell commands that modify system directories (outside workspace)\n" +
           "  - Reading or writing sensitive files (.env, credentials, keys)\n" +
           "  - System-level operations (chmod, chown, systemctl, docker rm)\n" +
-          "  - Network operations that mutate external state (POST/PUT/DELETE)\n\n" +
+          "  - Network mutations to services not related to the task goal\n\n" +
           "HOW IT WORKS:\n" +
           "  1. You call this tool describing the operation you want to perform\n" +
           "  2. If the operation is already allowlisted, it auto-approves instantly\n" +
