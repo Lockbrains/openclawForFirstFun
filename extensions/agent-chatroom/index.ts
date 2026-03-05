@@ -1992,8 +1992,10 @@ function pollInbox(cfg: ChatroomConfig, logger?: Logger): InboxMessage[] {
           });
           resolved = true;
         } else {
+          const tasksDirAbs = path.resolve(tasksDir(cfg));
           logger?.warn(
-            `[pollInbox] Retry notification for task ${notif.retry_for_task} could not resolve: task file not found at ${taskPath}. ` +
+            `[pollInbox] Retry notification for task ${notif.retry_for_task} could not resolve: task file not found. ` +
+              `Attempted path: ${path.resolve(taskPath)}. Worker tasksDir: ${tasksDirAbs}. ` +
               "Ensure orchestrator and worker share the same NAS root (tasks dir). Leaving notification file for retry.",
           );
           // Do not delete the file so it can be retried or inspected
@@ -4817,6 +4819,8 @@ async function executeStep(
   };
   /** Last tool/block activity — used to explain "Step did not complete" when agent never called complete_step/fail_step */
   let lastActivityDetail: string | null = null;
+  /** Final payload text from runner — when run ends without complete_step/fail_step, may contain the actual error (e.g. context overflow, timeout). */
+  let lastFinalPayloadText: string | null = null;
 
   const dispatcherOptions = {
     responsePrefix: prefixContext.responsePrefix,
@@ -4848,6 +4852,7 @@ async function executeStep(
       }
 
       if (kind === "final") {
+        lastFinalPayloadText = text;
         // Check if the step was completed via tool call
         const updatedPlan = readPlan(chatroomCfg, taskId);
         const updatedStep = updatedPlan?.steps.find((s) => s.step_id === step.step_id);
@@ -4933,19 +4938,27 @@ async function executeStep(
     };
   }
 
-  // When run ended without complete_step/fail_step, we don't get a single cause from the runner.
-  // Surface what we know so the user can act (e.g. timeout vs context overflow).
+  // When run ended without complete_step/fail_step, use runner's final payload as the reason when it looks like an error.
   if (!stepResult.success && stepResult.error_detail === "Step did not complete") {
-    const activity = lastActivityDetail
-      ? ` Last activity before run ended: ${lastActivityDetail}.`
-      : " No tool or block output was recorded.";
-    stepResult = {
-      ...stepResult,
-      error_detail:
-        "Run ended without the agent calling complete_step or fail_step." +
-        activity +
-        " Common causes: step timeout, context overflow, model rate limit, or empty/cut-off response. Check step timeout and context size.",
-    };
+    const looksLikeError =
+      lastFinalPayloadText &&
+      /overflow|timeout|failed|error|⚠️|Agent failed|Context limit|rate limit|cut-off/i.test(
+        lastFinalPayloadText,
+      );
+    if (looksLikeError && lastFinalPayloadText) {
+      stepResult = {
+        ...stepResult,
+        error_detail: `Run ended without complete_step or fail_step. ${lastFinalPayloadText.trim().slice(0, 1500)}`,
+      };
+    } else {
+      const activity = lastActivityDetail
+        ? ` Last activity before run ended: ${lastActivityDetail}.`
+        : " No tool or block output was recorded.";
+      stepResult = {
+        ...stepResult,
+        error_detail: "Run ended without the agent calling complete_step or fail_step." + activity,
+      };
+    }
   }
 
   return stepResult;
