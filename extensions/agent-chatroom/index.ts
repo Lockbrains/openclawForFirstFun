@@ -31,7 +31,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { execSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import * as path from "node:path";
 
 /** Current inbox message being processed; used so dispatch_task can read rag_free from the triggering message (programmatic, no LLM). */
@@ -289,6 +289,15 @@ interface Logger {
 function readJson(filePath: string): any {
   try {
     return JSON.parse(fs.readFileSync(filePath, "utf-8"));
+  } catch {
+    return null;
+  }
+}
+
+/** Async read to avoid Node/libuv assertion in timer callbacks (e.g. uv_fs_close in readFileSync). */
+async function readJsonAsync(filePath: string): Promise<any> {
+  try {
+    return JSON.parse(await readFile(filePath, "utf-8"));
   } catch {
     return null;
   }
@@ -1392,6 +1401,20 @@ function readAgentRegistry(cfg: ChatroomConfig): AgentRegistryEntry[] {
   return agents;
 }
 
+/** Async version for use in timer callback path (avoids readFileSync/libuv assertion). */
+async function readAgentRegistryAsync(cfg: ChatroomConfig): Promise<AgentRegistryEntry[]> {
+  const regDir = path.join(chatroomRoot(cfg), "registry");
+  if (!fs.existsSync(regDir)) return [];
+  const agents: AgentRegistryEntry[] = [];
+  const files = await readdir(regDir);
+  for (const file of files) {
+    if (!file.endsWith(".json")) continue;
+    const data = await readJsonAsync(path.join(regDir, file));
+    if (data?.agent_id) agents.push(data);
+  }
+  return agents;
+}
+
 function parseAtMentions(text: string): string[] {
   const matches = text.match(/@(\w+)/g);
   if (!matches) return [];
@@ -1506,6 +1529,16 @@ function sendMessageToNAS(
 function listAgentChannels(cfg: ChatroomConfig): any[] {
   const indexPath = path.join(chatroomRoot(cfg), "channels", "_index.json");
   const idx = readJson(indexPath);
+  if (!idx?.channels) return [];
+  return idx.channels.filter(
+    (ch: any) => Array.isArray(ch.members) && ch.members.includes(cfg.agentId),
+  );
+}
+
+/** Async version for use in timer callback path (avoids readFileSync/libuv assertion). */
+async function listAgentChannelsAsync(cfg: ChatroomConfig): Promise<any[]> {
+  const indexPath = path.join(chatroomRoot(cfg), "channels", "_index.json");
+  const idx = await readJsonAsync(indexPath);
   if (!idx?.channels) return [];
   return idx.channels.filter(
     (ch: any) => Array.isArray(ch.members) && ch.members.includes(cfg.agentId),
@@ -1925,9 +1958,10 @@ function pollInbox(cfg: ChatroomConfig, logger?: Logger): InboxMessage[] {
 
       // Fallback: retry notifications or missing message files — construct
       // a synthetic InboxMessage from the notification itself so it can still
-      // be routed (e.g. as a TASK_DISPATCH retry).
+      // be routed (e.g. as a TASK_DISPATCH retry). Task file must live in shared tasksDir (same NAS root as orchestrator).
       if (!resolved && notif.retry_for_task) {
-        const taskData = readJson(path.join(tasksDir(cfg), `${notif.retry_for_task}.json`));
+        const taskPath = path.join(tasksDir(cfg), `${notif.retry_for_task}.json`);
+        const taskData = readJson(taskPath);
         if (taskData) {
           messages.push({
             message_id: notif.notification_id ?? randomUUID(),
@@ -1957,6 +1991,13 @@ function pollInbox(cfg: ChatroomConfig, logger?: Logger): InboxMessage[] {
             },
           });
           resolved = true;
+        } else {
+          logger?.warn(
+            `[pollInbox] Retry notification for task ${notif.retry_for_task} could not resolve: task file not found at ${taskPath}. ` +
+              "Ensure orchestrator and worker share the same NAS root (tasks dir). Leaving notification file for retry.",
+          );
+          // Do not delete the file so it can be retried or inspected
+          continue;
         }
       }
 
@@ -2112,6 +2153,25 @@ function listTasksByStatus(cfg: ChatroomConfig, ...statuses: TaskStatus[]): Task
   for (const file of fs.readdirSync(dir)) {
     if (!file.endsWith(".json")) continue;
     const task = readJson(path.join(dir, file)) as TaskRecord | null;
+    if (task && statusSet.has(task.status)) tasks.push(task);
+  }
+  return tasks;
+}
+
+/** Async version to avoid readFileSync in timer callbacks (Node/libuv assertion). */
+async function listTasksByStatusAsync(
+  cfg: ChatroomConfig,
+  ...statuses: TaskStatus[]
+): Promise<TaskRecord[]> {
+  const dir = tasksDir(cfg);
+  if (!fs.existsSync(dir)) return [];
+
+  const statusSet = new Set(statuses);
+  const tasks: TaskRecord[] = [];
+  const files = await readdir(dir);
+  for (const file of files) {
+    if (!file.endsWith(".json")) continue;
+    const task = (await readJsonAsync(path.join(dir, file))) as TaskRecord | null;
     if (task && statusSet.has(task.status)) tasks.push(task);
   }
   return tasks;
@@ -2711,6 +2771,20 @@ function listParkedTasks(cfg: ChatroomConfig): ParkedTaskInfo[] {
   return results;
 }
 
+/** Async version for timer callback path (avoids readFileSync/libuv assertion). */
+async function listParkedTasksAsync(cfg: ChatroomConfig): Promise<ParkedTaskInfo[]> {
+  const dir = parkedTasksDir(cfg);
+  if (!fs.existsSync(dir)) return [];
+  const results: ParkedTaskInfo[] = [];
+  const files = await readdir(dir);
+  for (const file of files) {
+    if (!file.endsWith(".json")) continue;
+    const info = (await readJsonAsync(path.join(dir, file))) as ParkedTaskInfo | null;
+    if (info) results.push(info);
+  }
+  return results;
+}
+
 function checkParkCondition(
   cfg: ChatroomConfig,
   info: ParkedTaskInfo,
@@ -2800,8 +2874,42 @@ function checkParkCondition(
   }
 }
 
-function monitorParkedTasks(cfg: ChatroomConfig, runtime: any, config: any, logger: Logger): void {
-  const parked = listParkedTasks(cfg);
+/** Async version for permission case (avoids readFileSync in timer callback). */
+async function checkParkConditionAsync(
+  cfg: ChatroomConfig,
+  info: ParkedTaskInfo,
+  logger: Logger,
+): Promise<{ met: boolean; result: string }> {
+  if (info.watch_type === "permission") {
+    const permId = info.watch_config.permission_id;
+    if (!permId) return { met: false, result: "No permission_id configured" };
+    const permFile = path.join(permissionsDir(cfg), `${permId}.json`);
+    const perm = (await readJsonAsync(permFile)) as PermissionRecord | null;
+    if (!perm) return { met: false, result: "Permission record not found" };
+    if (perm.status === "approved" || perm.status === "allowlisted") {
+      return {
+        met: true,
+        result: `Permission ${perm.status} by ${perm.decided_by ?? "admin"}`,
+      };
+    }
+    if (perm.status === "rejected") {
+      return {
+        met: true,
+        result: `Permission REJECTED by ${perm.decided_by ?? "admin"}: ${perm.decision_reason ?? "no reason given"}`,
+      };
+    }
+    return { met: false, result: `Waiting for human approval (${perm.status})` };
+  }
+  return checkParkCondition(cfg, info, logger);
+}
+
+async function monitorParkedTasks(
+  cfg: ChatroomConfig,
+  runtime: any,
+  config: any,
+  logger: Logger,
+): Promise<void> {
+  const parked = await listParkedTasksAsync(cfg);
   if (parked.length === 0) return;
 
   const now = Date.now();
@@ -2839,7 +2947,7 @@ function monitorParkedTasks(cfg: ChatroomConfig, runtime: any, config: any, logg
     info.poll_count++;
     writeParkedTask(cfg, info);
 
-    const { met, result } = checkParkCondition(cfg, info, logger);
+    const { met, result } = await checkParkConditionAsync(cfg, info, logger);
     appendTaskProgress(cfg, info.task_id, {
       phase: "parked_poll",
       detail: `[poll #${info.poll_count}] ${result.slice(0, 200)}`,
@@ -3395,8 +3503,8 @@ function handleQuestionAnswer(cfg: ChatroomConfig, msg: InboxMessage, logger: Lo
 
 const RATE_LIMIT_RETRY_DELAY_MS = 60_000;
 
-function monitorPendingTasks(cfg: ChatroomConfig, logger: Logger): void {
-  const pending = listTasksByStatus(cfg, "DISPATCHED", "TIMEOUT", "RETRYING");
+async function monitorPendingTasks(cfg: ChatroomConfig, logger: Logger): Promise<void> {
+  const pending = await listTasksByStatusAsync(cfg, "DISPATCHED", "TIMEOUT", "RETRYING");
   const now = Date.now();
 
   for (const task of pending) {
@@ -3495,7 +3603,7 @@ function monitorPendingTasks(cfg: ChatroomConfig, logger: Logger): void {
   }
 
   // Check PROCESSING tasks for timeouts
-  const processing = listTasksByStatus(cfg, "ACKED", "PROCESSING");
+  const processing = await listTasksByStatusAsync(cfg, "ACKED", "PROCESSING");
   for (const task of processing) {
     if (task.from !== cfg.agentId) continue;
     const startedAt = new Date(task.started_at ?? task.acked_at ?? task.dispatched_at).getTime();
@@ -3519,7 +3627,7 @@ function monitorPendingTasks(cfg: ChatroomConfig, logger: Logger): void {
   }
 
   // React to error-typed FAILED tasks
-  const failed = listTasksByStatus(cfg, "FAILED");
+  const failed = await listTasksByStatusAsync(cfg, "FAILED");
   for (const task of failed) {
     if (task.from !== cfg.agentId) continue;
     if (!task.error_type) continue;
@@ -3563,13 +3671,13 @@ function monitorPendingTasks(cfg: ChatroomConfig, logger: Logger): void {
 // Orchestration context
 // ============================================================================
 
-function buildOrchestratorContext(
+async function buildOrchestratorContext(
   cfg: ChatroomConfig,
   sourceChannel?: string,
   currentMessageHumanApproval?: boolean,
-): string {
-  const agents = readAgentRegistry(cfg);
-  const channels = listAgentChannels(cfg);
+): Promise<string> {
+  const agents = await readAgentRegistryAsync(cfg);
+  const channels = await listAgentChannelsAsync(cfg);
 
   const otherAgents = agents.filter((a) => a.agent_id !== cfg.agentId);
   if (otherAgents.length === 0 && channels.length === 0) return "";
@@ -3706,7 +3814,7 @@ function buildOrchestratorContext(
   );
   lines.push(``);
 
-  const activeTasks = listTasksByStatus(
+  const activeTasks = await listTasksByStatusAsync(
     cfg,
     "DISPATCHED",
     "ACKED",
@@ -3738,9 +3846,10 @@ function buildOrchestratorContext(
     const plDir = plansDir(cfg);
     if (fs.existsSync(plDir)) {
       const pendingPlans: TaskPlan[] = [];
-      for (const f of fs.readdirSync(plDir)) {
+      const planFiles = await readdir(plDir);
+      for (const f of planFiles) {
         if (!f.endsWith(".json")) continue;
-        const plan = readJson(path.join(plDir, f)) as TaskPlan | null;
+        const plan = (await readJsonAsync(path.join(plDir, f))) as TaskPlan | null;
         if (plan && plan.status === "PENDING_REVIEW" && plan.approval?.mode === "human") {
           pendingPlans.push(plan);
         }
@@ -3832,11 +3941,11 @@ function buildWorkerContext(cfg: ChatroomConfig, sourceChannel?: string): string
   return lines.join("\n");
 }
 
-function buildChatroomContext(
+async function buildChatroomContext(
   cfg: ChatroomConfig,
   sourceChannel?: string,
   currentMessageHumanApproval?: boolean,
-): string {
+): Promise<string> {
   if (cfg.role === "orchestrator") {
     return buildOrchestratorContext(cfg, sourceChannel, currentMessageHumanApproval);
   }
@@ -3880,7 +3989,7 @@ async function autoDispatchMessage(
       : msg.from;
 
     const currentMessageHumanApproval = msg.metadata?.human_approval_required === true;
-    const chatroomContext = buildChatroomContext(
+    const chatroomContext = await buildChatroomContext(
       chatroomCfg,
       channelId,
       currentMessageHumanApproval,
@@ -4763,26 +4872,21 @@ async function executeStep(
             error_detail: text.slice(0, 500),
           };
         } else if (stepResult.success === false && stepResult.error_detail) {
-          // onError already fired — keep the failure, don't override with implicit success
+          // onError already fired or run ended without complete_step/fail_step — mark step FAILED
           updatePlanStep(chatroomCfg, taskId, step.step_id, {
             status: "FAILED",
             error_detail: stepResult.error_detail,
             completed_at: nowISO(),
           });
         } else {
-          // LLM finished but didn't call complete_step — treat as implicit success
-          const producedFiles = scanOutputDir(outputDir);
+          // Run ended without explicit complete_step/fail_step — do NOT treat as success.
+          // Mark as failed so the step is never shown as green; post-try block will set a clear error_detail.
           updatePlanStep(chatroomCfg, taskId, step.step_id, {
-            status: "COMPLETED",
-            result_summary: text.slice(0, 500),
-            output_files: producedFiles,
+            status: "FAILED",
+            error_detail: "Step did not complete",
             completed_at: nowISO(),
           });
-          stepResult = {
-            success: true,
-            result_summary: text.slice(0, 500),
-            output_files: producedFiles,
-          };
+          stepResult = { ...stepResult, success: false, error_detail: "Step did not complete" };
         }
       }
     },
@@ -4829,18 +4933,18 @@ async function executeStep(
     };
   }
 
-  // If we still have the generic "Step did not complete", explain why (no complete_step/fail_step; last activity)
+  // When run ended without complete_step/fail_step, we don't get a single cause from the runner.
+  // Surface what we know so the user can act (e.g. timeout vs context overflow).
   if (!stepResult.success && stepResult.error_detail === "Step did not complete") {
-    const possibleCauses =
-      "Possible causes: timeout, context overflow, model cooldown/rate limit, or empty response.";
+    const activity = lastActivityDetail
+      ? ` Last activity before run ended: ${lastActivityDetail}.`
+      : " No tool or block output was recorded.";
     stepResult = {
       ...stepResult,
       error_detail:
-        "Agent did not call chatroom_complete_step or chatroom_fail_step before the run ended. " +
-        possibleCauses +
-        (lastActivityDetail
-          ? ` Last activity: ${lastActivityDetail}`
-          : " No tool or block output was recorded."),
+        "Run ended without the agent calling complete_step or fail_step." +
+        activity +
+        " Common causes: step timeout, context overflow, model rate limit, or empty/cut-off response. Check step timeout and context size.",
     };
   }
 
@@ -7579,21 +7683,17 @@ const agentChatroomPlugin = {
         // Task timeout / retry monitor (orchestrator only — workers don't dispatch tasks)
         if (cfg.role === "orchestrator") {
           taskMonitorTimer = setInterval(() => {
-            try {
-              monitorPendingTasks(cfg, logger);
-            } catch {
+            void monitorPendingTasks(cfg, logger).catch(() => {
               /* ignore */
-            }
+            });
           }, taskMonitorIntervalMs);
         }
 
         // Park monitor — checks parked task conditions (all agents)
         parkMonitorTimer = setInterval(() => {
-          try {
-            monitorParkedTasks(cfg, runtime, config, logger);
-          } catch {
+          void monitorParkedTasks(cfg, runtime, config, logger).catch(() => {
             /* ignore */
-          }
+          });
         }, parkMonitorIntervalMs);
       },
       stop: async () => {
