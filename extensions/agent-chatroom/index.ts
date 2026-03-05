@@ -135,6 +135,17 @@ interface TaskRecord {
   agreed_deliverables?: AgreedDeliverables | null;
   /** Set when status is PARKED; used to show how long the task has been waiting. */
   parked_at?: string | null;
+  /** Last run context snapshot (for debugging context overflow / step end). Written by worker after each step. */
+  run_context_snapshot?: RunContextSnapshot | null;
+}
+
+interface RunContextSnapshot {
+  last_updated: string;
+  step_order?: number;
+  step_id?: string;
+  success?: boolean;
+  error_detail?: string | null;
+  note?: string;
 }
 
 // ── Plan Mode types ──────────────────────────────────────────────────────────
@@ -2385,6 +2396,14 @@ function validateDeliveryForAcceptance(
   task: TaskRecord,
   logger: Logger,
 ): { ok: true } | { ok: false; reason: string } {
+  // Never accept tasks that ended with context overflow or rate limit — they are failed, not delivered.
+  const errType = task.error_type;
+  if (errType === "CONTEXT_OVERFLOW" || errType === "RATE_LIMITED") {
+    return {
+      ok: false,
+      reason: `Task ended with error (${errType}). Cannot accept; treat as failed. Worker should have reported FAILED, not DELIVERED.`,
+    };
+  }
   const agreed = task.agreed_deliverables;
   if (!agreed?.items?.length) {
     return {
@@ -3958,6 +3977,8 @@ const DELIVERABLES_FILENAME = "DELIVERABLES.md";
 /**
  * Fetch RAG context and (for workers only) TOOLS.md + DELIVERABLES.md for the planning phase (before Plan).
  * Worker must use DELIVERABLES.md to decide what to declare in chatroom_confirm_deliverables.
+ * Skips RAG when the frontend sends metadata.rag_free === true (e.g. user set system instruction /rag-free).
+ * Do NOT infer from task text — only the frontend decides.
  */
 async function fetchPlanningContext(
   cfg: ChatroomConfig,
@@ -3967,57 +3988,66 @@ async function fetchPlanningContext(
   logger: Logger,
 ): Promise<{ ragText: string; toolsMdText: string; deliverablesMdText: string }> {
   const reportChannel = cfg.role === "orchestrator" ? "general" : `dm_${cfg.agentId}`;
-  const ragServiceUrl = process.env.RAG_SERVICE_URL || cfg.ragServiceUrl || "http://localhost:8000";
-  const query = msg.content.text.trim().slice(0, 500) || "Project context and conventions";
+  const skipRag = msg.metadata?.rag_free === true;
 
-  // ── 1. Query RAG ───────────────────────────────────────────────────────
   let ragText: string;
-  try {
-    sendMessageToNAS(cfg, reportChannel, `[RAG][QUERY] ${query}`, "STATUS_UPDATE");
-  } catch (e) {
-    logger.warn(`RAG report (QUERY) failed: ${e}`);
-  }
-  try {
-    const response = await fetch(`${ragServiceUrl}/query`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query, top_k: 5 }),
-    });
-    if (!response.ok) {
-      ragText = `RAG query failed (${response.status}). Proceed with your best judgment; do not fabricate project details.`;
+  if (skipRag) {
+    ragText =
+      "[RAG skipped for this task — frontend sent rag_free (e.g. system instruction /rag-free). Use TOOLS.md and DELIVERABLES.md below.]";
+    logger.info(`Planning context: skipping RAG for task ${taskId} (metadata.rag_free=true)`);
+  } else {
+    const ragServiceUrl =
+      process.env.RAG_SERVICE_URL || cfg.ragServiceUrl || "http://localhost:8000";
+    const query = msg.content.text.trim().slice(0, 500) || "Project context and conventions";
+
+    // ── 1. Query RAG ───────────────────────────────────────────────────────
+    try {
+      sendMessageToNAS(cfg, reportChannel, `[RAG][QUERY] ${query}`, "STATUS_UPDATE");
+    } catch (e) {
+      logger.warn(`RAG report (QUERY) failed: ${e}`);
+    }
+    try {
+      const response = await fetch(`${ragServiceUrl}/query`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query, top_k: 5 }),
+      });
+      if (!response.ok) {
+        ragText = `RAG query failed (${response.status}). Proceed with your best judgment; do not fabricate project details.`;
+        try {
+          sendMessageToNAS(cfg, reportChannel, `[RAG][ERROR] ${ragText}`, "STATUS_UPDATE");
+        } catch {
+          /* ignore */
+        }
+      } else {
+        const data = (await response.json()) as {
+          answer: string;
+          sources?: { text: string; source: string; score: number }[];
+          strategy?: string;
+        };
+        ragText =
+          `Answer:\n${data.answer}\n` +
+          (data.sources?.length
+            ? `\nSources:\n${data.sources.map((s, i) => `[${i + 1}] ${s.source}\n${s.text}`).join("\n\n")}`
+            : "");
+        try {
+          sendMessageToNAS(
+            cfg,
+            reportChannel,
+            `[RAG][RESPONSE] strategy: ${data.strategy ?? "unknown"}\n${data.answer}`,
+            "STATUS_UPDATE",
+          );
+        } catch {
+          /* ignore */
+        }
+      }
+    } catch (err) {
+      ragText = `RAG unavailable: ${err}. Proceed with your best judgment; do not fabricate project details.`;
       try {
         sendMessageToNAS(cfg, reportChannel, `[RAG][ERROR] ${ragText}`, "STATUS_UPDATE");
       } catch {
         /* ignore */
       }
-    } else {
-      const data = (await response.json()) as {
-        answer: string;
-        sources?: { text: string; source: string; score: number }[];
-        strategy?: string;
-      };
-      ragText =
-        `Answer:\n${data.answer}\n` +
-        (data.sources?.length
-          ? `\nSources:\n${data.sources.map((s, i) => `[${i + 1}] ${s.source}\n${s.text}`).join("\n\n")}`
-          : "");
-      try {
-        sendMessageToNAS(
-          cfg,
-          reportChannel,
-          `[RAG][RESPONSE] strategy: ${data.strategy ?? "unknown"}\n${data.answer}`,
-          "STATUS_UPDATE",
-        );
-      } catch {
-        /* ignore */
-      }
-    }
-  } catch (err) {
-    ragText = `RAG unavailable: ${err}. Proceed with your best judgment; do not fabricate project details.`;
-    try {
-      sendMessageToNAS(cfg, reportChannel, `[RAG][ERROR] ${ragText}`, "STATUS_UPDATE");
-    } catch {
-      /* ignore */
     }
   }
 
@@ -4054,7 +4084,7 @@ async function fetchPlanningContext(
     }
   }
 
-  return { ragText, toolsMdText, deliverablesMdText };
+  return { ragText, toolsMdText, deliverablesMdText, ragSkipped: skipRag };
 }
 
 /**
@@ -4087,7 +4117,7 @@ async function planningPhase(
         ? "Querying RAG, loading TOOLS.md and DELIVERABLES.md"
         : "Querying RAG",
   });
-  const { ragText, toolsMdText, deliverablesMdText } = await fetchPlanningContext(
+  const { ragText, toolsMdText, deliverablesMdText, ragSkipped } = await fetchPlanningContext(
     chatroomCfg,
     msg,
     taskId,
@@ -4105,6 +4135,12 @@ async function planningPhase(
   const planningPromptParts: string[] = [
     ``,
     `═══ RAG CONTEXT (retrieved before planning — use for project knowledge) ═══`,
+    ...(ragSkipped
+      ? []
+      : [
+          "This task REQUIRES RAG for project knowledge. Use the context below and call rag_query during execution when needed.",
+          "",
+        ]),
     ragText,
     ``,
   ];
@@ -4393,6 +4429,17 @@ async function stepExecutionLoop(
         error_detail: `Unhandled error during step execution: ${errMsg}`,
       };
     }
+
+    updateTaskRecord(chatroomCfg, taskId, {
+      run_context_snapshot: {
+        last_updated: nowISO(),
+        step_order: step.order,
+        step_id: step.step_id,
+        success: result.success,
+        error_detail: result.error_detail ?? undefined,
+        note: "Updated after each step run for context/debugging.",
+      },
+    } as Partial<TaskRecord>);
 
     if (result.success) {
       previousResults.push({ title: step.title, result: result.result_summary });
@@ -4698,13 +4745,16 @@ async function executeStep(
 
   // If we still have the generic "Step did not complete", explain why (no complete_step/fail_step; last activity)
   if (!stepResult.success && stepResult.error_detail === "Step did not complete") {
+    const possibleCauses =
+      "Possible causes: timeout, context overflow, model cooldown/rate limit, or empty response.";
     stepResult = {
       ...stepResult,
       error_detail:
         "Agent did not call chatroom_complete_step or chatroom_fail_step before the run ended. " +
+        possibleCauses +
         (lastActivityDetail
-          ? `Last activity: ${lastActivityDetail}`
-          : "No tool or block output was recorded (possible timeout or empty response)."),
+          ? ` Last activity: ${lastActivityDetail}`
+          : " No tool or block output was recorded."),
     };
   }
 
@@ -4870,10 +4920,25 @@ async function autoDispatchForTask(
         if (payload.isError) {
           const errType = classifyError(text);
           logger.warn(`Task ${taskId} LLM error [${errType}]: ${text.slice(0, 150)}`);
+          updateTaskRecord(chatroomCfg, taskId, {
+            run_context_snapshot: {
+              last_updated: nowISO(),
+              success: false,
+              error_detail: text.slice(0, 2000),
+              note: "Legacy task run (no plan).",
+            },
+          } as Partial<TaskRecord>);
           sendTaskResult(chatroomCfg, taskId, text, "FAILED", logger, [], errType);
           return;
         }
 
+        updateTaskRecord(chatroomCfg, taskId, {
+          run_context_snapshot: {
+            last_updated: nowISO(),
+            success: true,
+            note: "Legacy task run (no plan).",
+          },
+        } as Partial<TaskRecord>);
         const producedFiles = scanOutputDir(outputDir as string);
         sendTaskResult(chatroomCfg, taskId, text, "DONE", logger, producedFiles);
       } catch (err) {
@@ -4887,6 +4952,14 @@ async function autoDispatchForTask(
       const errType = classifyError(String(err));
       logger.error(`Task dispatch error for ${taskId} (${info?.kind}) [${errType}]: ${err}`);
       try {
+        updateTaskRecord(chatroomCfg, taskId, {
+          run_context_snapshot: {
+            last_updated: nowISO(),
+            success: false,
+            error_detail: errText.slice(0, 2000),
+            note: `Legacy task run error [${errType}].`,
+          },
+        } as Partial<TaskRecord>);
         sendTaskResult(chatroomCfg, taskId, errText, "FAILED", logger, [], errType);
       } catch {
         /* ignore */
