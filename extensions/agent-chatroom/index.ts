@@ -6009,6 +6009,32 @@ const agentChatroomPlugin = {
               const ragFree = currentMsg?.metadata?.rag_free === true;
               const timeoutMs = (p.timeout_minutes ?? 60) * 60_000;
               let instruction = p.instruction;
+
+              // Inject per-agent rules if any are enabled
+              try {
+                const agentRulesFile = path.join(
+                  cfg.nasRoot,
+                  "chatroom",
+                  "config",
+                  `agent_rules_${p.target}.json`,
+                );
+                if (fs.existsSync(agentRulesFile)) {
+                  const allAgentRules = JSON.parse(
+                    fs.readFileSync(agentRulesFile, "utf-8"),
+                  ) as Array<{ title: string; content: string; enabled: boolean }>;
+                  const enabledRules = allAgentRules.filter((r) => r.enabled);
+                  if (enabledRules.length > 0) {
+                    const rulesBlock = enabledRules
+                      .map((r) => `  [${r.title}]\n  ${r.content}`)
+                      .join("\n\n");
+                    instruction +=
+                      `\n\n═══ AGENT RULES (User-defined for ${p.target}) ═══\n` + rulesBlock;
+                  }
+                }
+              } catch {
+                /* ignore errors reading agent rules */
+              }
+
               if (p.long_running) {
                 instruction +=
                   "\n\n[LONG-RUNNING TASK] This task may involve operations that take minutes " +
