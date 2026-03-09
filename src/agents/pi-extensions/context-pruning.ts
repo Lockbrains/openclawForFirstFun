@@ -14,6 +14,7 @@ export type {
   EffectiveContextPruningSettings,
 } from "./context-pruning/settings.js";
 export {
+  CHATROOM_CONTEXT_PRUNING_SETTINGS,
   computeEffectiveSettings,
   DEFAULT_CONTEXT_PRUNING_SETTINGS,
 } from "./context-pruning/settings.js";

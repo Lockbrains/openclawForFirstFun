@@ -8,10 +8,13 @@ import { listDeliverableMessageChannels } from "../utils/message-channel.js";
 /**
  * Controls which hardcoded sections are included in the system prompt.
  * - "full": All sections (default, for main agent)
+ * - "chatroom": Trimmed for chatroom agents — keeps Tooling, Safety, Workspace,
+ *   Runtime, Skills, Context Files, Heartbeats; drops Reply Tags, Messaging,
+ *   Silent Replies, Self-Update, Model Aliases, CLI Reference, Docs, Voice.
  * - "minimal": Reduced sections (Tooling, Workspace, Runtime) - used for subagents
  * - "none": Just basic identity line, no sections
  */
-export type PromptMode = "full" | "minimal" | "none";
+export type PromptMode = "full" | "chatroom" | "minimal" | "none";
 
 function buildSkillsSection(params: {
   skillsPrompt?: string;
@@ -79,8 +82,8 @@ function buildTimeSection(params: { userTimezone?: string }) {
   return ["## Current Date & Time", `Time zone: ${params.userTimezone}`, ""];
 }
 
-function buildReplyTagsSection(isMinimal: boolean) {
-  if (isMinimal) {
+function buildReplyTagsSection(isMinimal: boolean, isChatroom = false) {
+  if (isMinimal || isChatroom) {
     return [];
   }
   return [
@@ -96,13 +99,14 @@ function buildReplyTagsSection(isMinimal: boolean) {
 
 function buildMessagingSection(params: {
   isMinimal: boolean;
+  isChatroom?: boolean;
   availableTools: Set<string>;
   messageChannelOptions: string;
   inlineButtonsEnabled: boolean;
   runtimeChannel?: string;
   messageToolHints?: string[];
 }) {
-  if (params.isMinimal) {
+  if (params.isMinimal || params.isChatroom) {
     return [];
   }
   return [
@@ -132,8 +136,8 @@ function buildMessagingSection(params: {
   ];
 }
 
-function buildVoiceSection(params: { isMinimal: boolean; ttsHint?: string }) {
-  if (params.isMinimal) {
+function buildVoiceSection(params: { isMinimal: boolean; isChatroom?: boolean; ttsHint?: string }) {
+  if (params.isMinimal || params.isChatroom) {
     return [];
   }
   const hint = params.ttsHint?.trim();
@@ -143,9 +147,14 @@ function buildVoiceSection(params: { isMinimal: boolean; ttsHint?: string }) {
   return ["## Voice (TTS)", hint, ""];
 }
 
-function buildDocsSection(params: { docsPath?: string; isMinimal: boolean; readToolName: string }) {
+function buildDocsSection(params: {
+  docsPath?: string;
+  isMinimal: boolean;
+  isChatroom?: boolean;
+  readToolName: string;
+}) {
   const docsPath = params.docsPath?.trim();
-  if (!docsPath || params.isMinimal) {
+  if (!docsPath || params.isMinimal || params.isChatroom) {
     return [];
   }
   return [
@@ -348,6 +357,7 @@ export function buildAgentSystemPrompt(params: {
   const messageChannelOptions = listDeliverableMessageChannels().join("|");
   const promptMode = params.promptMode ?? "full";
   const isMinimal = promptMode === "minimal" || promptMode === "none";
+  const isChatroom = promptMode === "chatroom";
   const safetySection = [
     "## Safety",
     "You have no independent goals: do not pursue self-preservation, replication, resource acquisition, or power-seeking; avoid long-term plans beyond the user's request.",
@@ -368,6 +378,7 @@ export function buildAgentSystemPrompt(params: {
   const docsSection = buildDocsSection({
     docsPath: params.docsPath,
     isMinimal,
+    isChatroom,
     readToolName,
   });
   const workspaceNotes = (params.workspaceNotes ?? []).map((note) => note.trim()).filter(Boolean);
@@ -412,20 +423,24 @@ export function buildAgentSystemPrompt(params: {
     "Use plain human language for narration unless in a technical context.",
     "",
     ...safetySection,
-    "## FirstClaw CLI Quick Reference",
-    "FirstClaw is controlled via subcommands. Do not invent commands.",
-    "To manage the Gateway daemon service (start/stop/restart):",
-    "- firstclaw gateway status",
-    "- firstclaw gateway start",
-    "- firstclaw gateway stop",
-    "- firstclaw gateway restart",
-    "If unsure, ask the user to run `firstclaw help` (or `firstclaw gateway --help`) and paste the output.",
-    "",
+    ...(isChatroom
+      ? []
+      : [
+          "## FirstClaw CLI Quick Reference",
+          "FirstClaw is controlled via subcommands. Do not invent commands.",
+          "To manage the Gateway daemon service (start/stop/restart):",
+          "- firstclaw gateway status",
+          "- firstclaw gateway start",
+          "- firstclaw gateway stop",
+          "- firstclaw gateway restart",
+          "If unsure, ask the user to run `firstclaw help` (or `firstclaw gateway --help`) and paste the output.",
+          "",
+        ]),
     ...skillsSection,
     ...memorySection,
-    // Skip self-update for subagent/none modes
-    hasGateway && !isMinimal ? "## FirstClaw Self-Update" : "",
-    hasGateway && !isMinimal
+    // Skip self-update for subagent/none/chatroom modes
+    hasGateway && !isMinimal && !isChatroom ? "## FirstClaw Self-Update" : "",
+    hasGateway && !isMinimal && !isChatroom
       ? [
           "Get Updates (self-update) is ONLY allowed when the user explicitly asks for it.",
           "Do not run config.apply or update.run unless the user explicitly requests an update or config change; if it's not explicit, ask first.",
@@ -433,19 +448,21 @@ export function buildAgentSystemPrompt(params: {
           "After restart, FirstClaw pings the last active session automatically.",
         ].join("\n")
       : "",
-    hasGateway && !isMinimal ? "" : "",
+    hasGateway && !isMinimal && !isChatroom ? "" : "",
     "",
-    // Skip model aliases for subagent/none modes
-    params.modelAliasLines && params.modelAliasLines.length > 0 && !isMinimal
+    // Skip model aliases for subagent/none/chatroom modes
+    params.modelAliasLines && params.modelAliasLines.length > 0 && !isMinimal && !isChatroom
       ? "## Model Aliases"
       : "",
-    params.modelAliasLines && params.modelAliasLines.length > 0 && !isMinimal
+    params.modelAliasLines && params.modelAliasLines.length > 0 && !isMinimal && !isChatroom
       ? "Prefer aliases when specifying model overrides; full provider/model is also accepted."
       : "",
-    params.modelAliasLines && params.modelAliasLines.length > 0 && !isMinimal
+    params.modelAliasLines && params.modelAliasLines.length > 0 && !isMinimal && !isChatroom
       ? params.modelAliasLines.join("\n")
       : "",
-    params.modelAliasLines && params.modelAliasLines.length > 0 && !isMinimal ? "" : "",
+    params.modelAliasLines && params.modelAliasLines.length > 0 && !isMinimal && !isChatroom
+      ? ""
+      : "",
     userTimezone
       ? "If you need the current date, time, or day of week, run session_status (📊 session_status)."
       : "",
@@ -504,22 +521,26 @@ export function buildAgentSystemPrompt(params: {
     "## Workspace Files (injected)",
     "These user-editable files are loaded by FirstClaw and included below in Project Context.",
     "",
-    ...buildReplyTagsSection(isMinimal),
+    ...buildReplyTagsSection(isMinimal, isChatroom),
     ...buildMessagingSection({
       isMinimal,
+      isChatroom,
       availableTools,
       messageChannelOptions,
       inlineButtonsEnabled,
       runtimeChannel,
       messageToolHints: params.messageToolHints,
     }),
-    ...buildVoiceSection({ isMinimal, ttsHint: params.ttsHint }),
+    ...buildVoiceSection({ isMinimal, isChatroom, ttsHint: params.ttsHint }),
   ];
 
   if (extraSystemPrompt) {
-    // Use "Subagent Context" header for minimal mode (subagents), otherwise "Group Chat Context"
     const contextHeader =
-      promptMode === "minimal" ? "## Subagent Context" : "## Group Chat Context";
+      promptMode === "minimal"
+        ? "## Subagent Context"
+        : promptMode === "chatroom"
+          ? "## Chatroom Context"
+          : "## Group Chat Context";
     lines.push(contextHeader, extraSystemPrompt, "");
   }
   if (params.reactionGuidance) {
@@ -568,8 +589,8 @@ export function buildAgentSystemPrompt(params: {
     }
   }
 
-  // Skip silent replies for subagent/none modes
-  if (!isMinimal) {
+  // Skip silent replies for subagent/none/chatroom modes
+  if (!isMinimal && !isChatroom) {
     lines.push(
       "## Silent Replies",
       `When you have nothing to say, respond with ONLY: ${SILENT_REPLY_TOKEN}`,

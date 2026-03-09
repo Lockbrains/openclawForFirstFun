@@ -126,6 +126,10 @@ export type AgentDefaultsConfig = {
   envelopeElapsed?: "on" | "off";
   /** Optional context window cap (used for runtime estimates + status %). */
   contextTokens?: number;
+  /** Max share of context window a single tool result may occupy (0-1, default 0.3). */
+  maxToolResultShare?: number;
+  /** Hard character limit for a single tool result text block (default 400,000). */
+  maxToolResultChars?: number;
   /** Optional CLI backends for text-only fallback (claude-cli, etc.). */
   cliBackends?: Record<string, CliBackendConfig>;
   /** Opt-in: prune old tool results from the LLM context to reduce token usage. */

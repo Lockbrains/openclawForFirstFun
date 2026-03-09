@@ -7,16 +7,21 @@ import { log } from "./logger.js";
  * Maximum share of the context window a single tool result should occupy.
  * This is intentionally conservative – a single tool result should not
  * consume more than 30% of the context window even without other messages.
+ * Override via agents.defaults.maxToolResultShare in config.
  */
-const MAX_TOOL_RESULT_CONTEXT_SHARE = 0.3;
+const DEFAULT_MAX_TOOL_RESULT_CONTEXT_SHARE = 0.3;
 
 /**
  * Hard character limit for a single tool result text block.
  * Even for the largest context windows (~2M tokens), a single tool result
  * should not exceed ~400K characters (~100K tokens).
  * This acts as a safety net when we don't know the context window size.
+ * Override via agents.defaults.maxToolResultChars in config.
  */
-export const HARD_MAX_TOOL_RESULT_CHARS = 400_000;
+export const DEFAULT_HARD_MAX_TOOL_RESULT_CHARS = 400_000;
+
+// Re-export under original name for backward compatibility
+export const HARD_MAX_TOOL_RESULT_CHARS = DEFAULT_HARD_MAX_TOOL_RESULT_CHARS;
 
 /**
  * Minimum characters to keep when truncating.
@@ -56,12 +61,29 @@ export function truncateToolResultText(text: string, maxChars: number): string {
  *
  * Uses a rough 4 chars ≈ 1 token heuristic (conservative for English text;
  * actual ratio varies by tokenizer).
+ *
+ * @param overrides Optional config-level caps from agents.defaults.maxToolResultShare / maxToolResultChars.
  */
-export function calculateMaxToolResultChars(contextWindowTokens: number): number {
-  const maxTokens = Math.floor(contextWindowTokens * MAX_TOOL_RESULT_CONTEXT_SHARE);
-  // Rough conversion: ~4 chars per token on average
+export function calculateMaxToolResultChars(
+  contextWindowTokens: number,
+  overrides?: { maxShare?: number; hardMaxChars?: number },
+): number {
+  const share =
+    typeof overrides?.maxShare === "number" &&
+    Number.isFinite(overrides.maxShare) &&
+    overrides.maxShare > 0 &&
+    overrides.maxShare <= 1
+      ? overrides.maxShare
+      : DEFAULT_MAX_TOOL_RESULT_CONTEXT_SHARE;
+  const hardMax =
+    typeof overrides?.hardMaxChars === "number" &&
+    Number.isFinite(overrides.hardMaxChars) &&
+    overrides.hardMaxChars > 0
+      ? overrides.hardMaxChars
+      : DEFAULT_HARD_MAX_TOOL_RESULT_CHARS;
+  const maxTokens = Math.floor(contextWindowTokens * share);
   const maxChars = maxTokens * 4;
-  return Math.min(maxChars, HARD_MAX_TOOL_RESULT_CHARS);
+  return Math.min(maxChars, hardMax);
 }
 
 /**
@@ -140,9 +162,10 @@ export async function truncateOversizedToolResultsInSession(params: {
   contextWindowTokens: number;
   sessionId?: string;
   sessionKey?: string;
+  toolResultOverrides?: { maxShare?: number; hardMaxChars?: number };
 }): Promise<{ truncated: boolean; truncatedCount: number; reason?: string }> {
   const { sessionFile, contextWindowTokens } = params;
-  const maxChars = calculateMaxToolResultChars(contextWindowTokens);
+  const maxChars = calculateMaxToolResultChars(contextWindowTokens, params.toolResultOverrides);
 
   try {
     const sessionManager = SessionManager.open(sessionFile);
@@ -272,8 +295,9 @@ export async function truncateOversizedToolResultsInSession(params: {
 export function truncateOversizedToolResultsInMessages(
   messages: AgentMessage[],
   contextWindowTokens: number,
+  overrides?: { maxShare?: number; hardMaxChars?: number },
 ): { messages: AgentMessage[]; truncatedCount: number } {
-  const maxChars = calculateMaxToolResultChars(contextWindowTokens);
+  const maxChars = calculateMaxToolResultChars(contextWindowTokens, overrides);
   let truncatedCount = 0;
 
   const result = messages.map((msg) => {
@@ -310,9 +334,10 @@ export function isOversizedToolResult(msg: AgentMessage, contextWindowTokens: nu
 export function sessionLikelyHasOversizedToolResults(params: {
   messages: AgentMessage[];
   contextWindowTokens: number;
+  toolResultOverrides?: { maxShare?: number; hardMaxChars?: number };
 }): boolean {
   const { messages, contextWindowTokens } = params;
-  const maxChars = calculateMaxToolResultChars(contextWindowTokens);
+  const maxChars = calculateMaxToolResultChars(contextWindowTokens, params.toolResultOverrides);
 
   for (const msg of messages) {
     if ((msg as { role?: string }).role !== "toolResult") {

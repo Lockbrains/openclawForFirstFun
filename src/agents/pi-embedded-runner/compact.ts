@@ -14,7 +14,7 @@ import { resolveHeartbeatPrompt } from "../../auto-reply/heartbeat.js";
 import { resolveChannelCapabilities } from "../../config/channel-capabilities.js";
 import { getMachineDisplayName } from "../../infra/machine-name.js";
 import { type enqueueCommand, enqueueCommandInLane } from "../../process/command-queue.js";
-import { isSubagentSessionKey } from "../../routing/session-key.js";
+import { isChatroomSessionKey, isSubagentSessionKey } from "../../routing/session-key.js";
 import { resolveUserPath } from "../../utils.js";
 import { normalizeMessageChannel } from "../../utils/message-channel.js";
 import { isReasoningTagProvider } from "../../utils/provider-utils.js";
@@ -283,7 +283,11 @@ export async function compactEmbeddedPiSessionDirect(
       config: params.config,
     });
     const isDefaultAgent = sessionAgentId === defaultAgentId;
-    const promptMode = isSubagentSessionKey(params.sessionKey) ? "minimal" : "full";
+    const promptMode = isSubagentSessionKey(params.sessionKey)
+      ? "minimal"
+      : isChatroomSessionKey(params.sessionKey)
+        ? "chatroom"
+        : "full";
     const docsPath = await resolveFirstClawDocsPath({
       workspaceDir: effectiveWorkspace,
       argv1: process.argv[1],
@@ -348,6 +352,7 @@ export async function compactEmbeddedPiSessionDirect(
       buildEmbeddedExtensionPaths({
         cfg: params.config,
         sessionManager,
+        sessionKey: params.sessionKey,
         provider,
         modelId,
         model,

@@ -64,6 +64,30 @@ export const DEFAULT_CONTEXT_PRUNING_SETTINGS: EffectiveContextPruningSettings =
   },
 };
 
+/**
+ * Recommended context pruning defaults for chatroom agents.
+ * More aggressive than the standard defaults to preserve context budget
+ * for task-specific work in multi-agent chatroom scenarios.
+ */
+export const CHATROOM_CONTEXT_PRUNING_SETTINGS: EffectiveContextPruningSettings = {
+  mode: "cache-ttl",
+  ttlMs: 2 * 60 * 1000,
+  keepLastAssistants: 2,
+  softTrimRatio: 0.15,
+  hardClearRatio: 0.3,
+  minPrunableToolChars: 30_000,
+  tools: {},
+  softTrim: {
+    maxChars: 2_000,
+    headChars: 800,
+    tailChars: 800,
+  },
+  hardClear: {
+    enabled: true,
+    placeholder: "[Old tool result content cleared]",
+  },
+};
+
 export function computeEffectiveSettings(raw: unknown): EffectiveContextPruningSettings | null {
   if (!raw || typeof raw !== "object") {
     return null;

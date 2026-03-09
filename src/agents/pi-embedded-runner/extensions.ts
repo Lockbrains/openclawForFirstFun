@@ -3,11 +3,15 @@ import type { SessionManager } from "@mariozechner/pi-coding-agent";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { FirstClawConfig } from "../../config/config.js";
+import { isChatroomSessionKey } from "../../routing/session-key.js";
 import { resolveContextWindowInfo } from "../context-window-guard.js";
 import { DEFAULT_CONTEXT_TOKENS } from "../defaults.js";
 import { setCompactionSafeguardRuntime } from "../pi-extensions/compaction-safeguard-runtime.js";
 import { setContextPruningRuntime } from "../pi-extensions/context-pruning/runtime.js";
-import { computeEffectiveSettings } from "../pi-extensions/context-pruning/settings.js";
+import {
+  CHATROOM_CONTEXT_PRUNING_SETTINGS,
+  computeEffectiveSettings,
+} from "../pi-extensions/context-pruning/settings.js";
 import { makeToolPrunablePredicate } from "../pi-extensions/context-pruning/tools.js";
 import { ensurePiCompactionReserveTokens } from "../pi-settings.js";
 import { isCacheTtlEligibleProvider, readLastCacheTtlTimestamp } from "./cache-ttl.js";
@@ -38,11 +42,29 @@ function resolveContextWindowTokens(params: {
 function buildContextPruningExtension(params: {
   cfg: FirstClawConfig | undefined;
   sessionManager: SessionManager;
+  sessionKey?: string;
   provider: string;
   modelId: string;
   model: Model<Api> | undefined;
 }): { additionalExtensionPaths?: string[] } {
   const raw = params.cfg?.agents?.defaults?.contextPruning;
+  const chatroom = isChatroomSessionKey(params.sessionKey);
+
+  // Chatroom sessions auto-enable pruning with the chatroom preset when no
+  // explicit config is provided. This keeps tool result bloat in check for
+  // multi-agent chatroom workloads without requiring manual configuration.
+  if (chatroom && raw?.mode !== "cache-ttl") {
+    setContextPruningRuntime(params.sessionManager, {
+      settings: CHATROOM_CONTEXT_PRUNING_SETTINGS,
+      contextWindowTokens: resolveContextWindowTokens(params),
+      isToolPrunable: makeToolPrunablePredicate(CHATROOM_CONTEXT_PRUNING_SETTINGS.tools),
+      lastCacheTouchAt: readLastCacheTtlTimestamp(params.sessionManager),
+    });
+    return {
+      additionalExtensionPaths: [resolvePiExtensionPath("context-pruning")],
+    };
+  }
+
   if (raw?.mode !== "cache-ttl") {
     return {};
   }
@@ -74,6 +96,7 @@ function resolveCompactionMode(cfg?: FirstClawConfig): "default" | "safeguard" {
 export function buildEmbeddedExtensionPaths(params: {
   cfg: FirstClawConfig | undefined;
   sessionManager: SessionManager;
+  sessionKey?: string;
   provider: string;
   modelId: string;
   model: Model<Api> | undefined;

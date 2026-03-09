@@ -10,7 +10,11 @@ import { resolveChannelCapabilities } from "../../../config/channel-capabilities
 import { getMachineDisplayName } from "../../../infra/machine-name.js";
 import { MAX_IMAGE_BYTES } from "../../../media/constants.js";
 import { getGlobalHookRunner } from "../../../plugins/hook-runner-global.js";
-import { isSubagentSessionKey, normalizeAgentId } from "../../../routing/session-key.js";
+import {
+  isChatroomSessionKey,
+  isSubagentSessionKey,
+  normalizeAgentId,
+} from "../../../routing/session-key.js";
 import { resolveUserPath } from "../../../utils.js";
 import { normalizeMessageChannel } from "../../../utils/message-channel.js";
 import { isReasoningTagProvider } from "../../../utils/provider-utils.js";
@@ -310,7 +314,11 @@ export async function runEmbeddedAttempt(
       },
     });
     const isDefaultAgent = sessionAgentId === defaultAgentId;
-    const promptMode = isSubagentSessionKey(params.sessionKey) ? "minimal" : "full";
+    const promptMode = isSubagentSessionKey(params.sessionKey)
+      ? "minimal"
+      : isChatroomSessionKey(params.sessionKey)
+        ? "chatroom"
+        : "full";
     const docsPath = await resolveFirstClawDocsPath({
       workspaceDir: effectiveWorkspace,
       argv1: process.argv[1],
@@ -419,6 +427,7 @@ export async function runEmbeddedAttempt(
       buildEmbeddedExtensionPaths({
         cfg: params.config,
         sessionManager,
+        sessionKey: params.sessionKey,
         provider: params.provider,
         modelId: params.modelId,
         model: params.model,

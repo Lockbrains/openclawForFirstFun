@@ -543,10 +543,15 @@ export async function runEmbeddedPiAgent(
             // context window and compaction cannot reduce it further.
             if (!toolResultTruncationAttempted) {
               const contextWindowTokens = ctxInfo.tokens;
+              const toolResultOverrides = {
+                maxShare: params.config?.agents?.defaults?.maxToolResultShare,
+                hardMaxChars: params.config?.agents?.defaults?.maxToolResultChars,
+              };
               const hasOversized = attempt.messagesSnapshot
                 ? sessionLikelyHasOversizedToolResults({
                     messages: attempt.messagesSnapshot,
                     contextWindowTokens,
+                    toolResultOverrides,
                   })
                 : false;
 
@@ -561,6 +566,7 @@ export async function runEmbeddedPiAgent(
                   contextWindowTokens,
                   sessionId: params.sessionId,
                   sessionKey: params.sessionKey,
+                  toolResultOverrides,
                 });
                 if (truncResult.truncated) {
                   log.info(

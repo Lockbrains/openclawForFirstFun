@@ -45,6 +45,15 @@ export function isSubagentSessionKey(sessionKey: string | undefined | null): boo
   return Boolean((parsed?.rest ?? "").toLowerCase().startsWith("subagent:"));
 }
 
+export function isChatroomSessionKey(sessionKey: string | undefined | null): boolean {
+  const raw = (sessionKey ?? "").trim();
+  if (!raw) {
+    return false;
+  }
+  const parsed = parseAgentSessionKey(raw);
+  return Boolean((parsed?.rest ?? "").toLowerCase().startsWith("chatroom:"));
+}
+
 export function isAcpSessionKey(sessionKey: string | undefined | null): boolean {
   const raw = (sessionKey ?? "").trim();
   if (!raw) {

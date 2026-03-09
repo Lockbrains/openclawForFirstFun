@@ -150,6 +150,8 @@ interface TaskRecord {
   agreed_deliverables?: AgreedDeliverables | null;
   /** Set when status is PARKED; used to show how long the task has been waiting. */
   parked_at?: string | null;
+  context_retries?: number;
+  max_context_retries?: number;
   /** Last run context snapshot (for debugging context overflow / step end). Written by worker after each step. */
   run_context_snapshot?: RunContextSnapshot | null;
 }
@@ -2357,6 +2359,8 @@ function createTaskRecord(
     ack_timeout_ms: opts?.ackTimeoutMs ?? 60_000,
     task_timeout_ms: opts?.taskTimeoutMs ?? 3_600_000,
     resume_strategy: getResumeStrategy(to, opts?.resumeStrategy),
+    context_retries: 0,
+    max_context_retries: 2,
     // Orchestrator does not set expected_deliverables; Worker confirms via agreed_deliverables.
   };
 
@@ -2482,6 +2486,8 @@ async function resetAgentStatusAsync(
   if (info.status === "working" || info.status === "waiting") {
     info.status = "idle";
     info.current_task = null;
+    info.cooldown_until = null;
+    info.cooldown_reason = null;
     await writeJsonAsync(regPath, info);
     logger.info(`Reset ${agentId} status to idle`);
   }
@@ -2845,6 +2851,7 @@ async function sendTaskResult(
   logger: Logger,
   assetPaths: string[] = [],
   errorType?: TaskErrorType | null,
+  usageMeta?: { input?: number; output?: number; cacheRead?: number; total?: number } | null,
 ): Promise<void> {
   finalizeTaskProgress(cfg, taskId);
 
@@ -2866,12 +2873,28 @@ async function sendTaskResult(
       uriAssetPaths.map((p) => `  • ${p}`).join("\n");
   }
 
-  sendMessageToNAS(cfg, task.channel_id, enrichedText, "RESULT_REPORT", [task.from], undefined, {
+  const metadata: Record<string, unknown> = {
     task_id: taskId,
     status: reportStatus,
     asset_paths: uriAssetPaths,
     error_type: errorType ?? undefined,
-  });
+  };
+  if (usageMeta) {
+    if (usageMeta.input != null) metadata.usage_input = usageMeta.input;
+    if (usageMeta.output != null) metadata.usage_output = usageMeta.output;
+    if (usageMeta.cacheRead != null) metadata.usage_cache_read = usageMeta.cacheRead;
+    if (usageMeta.total != null) metadata.usage_total = usageMeta.total;
+  }
+
+  sendMessageToNAS(
+    cfg,
+    task.channel_id,
+    enrichedText,
+    "RESULT_REPORT",
+    [task.from],
+    undefined,
+    metadata,
+  );
   const patch: Partial<TaskRecord> = {
     status: reportStatus as TaskStatus,
     completed_at: status === "FAILED" ? nowISO() : null,
@@ -3027,9 +3050,62 @@ function resetAgentStatus(cfg: ChatroomConfig, agentId: string, logger: Logger):
   if (info.status === "working" || info.status === "waiting") {
     info.status = "idle";
     info.current_task = null;
+    info.cooldown_until = null;
+    info.cooldown_reason = null;
     writeJson(regPath, info);
     logger.info(`Reset ${agentId} status to idle`);
   }
+}
+
+function setAgentCooldown(
+  cfg: ChatroomConfig,
+  agentId: string,
+  cooldownUntil: string,
+  reason: string,
+): void {
+  const regPath = path.join(chatroomRoot(cfg), "registry", `${agentId}.json`);
+  const info = readJson(regPath);
+  if (!info) return;
+  info.status = "waiting";
+  info.cooldown_until = cooldownUntil;
+  info.cooldown_reason = reason;
+  writeJson(regPath, info);
+}
+
+function clearAgentCooldown(cfg: ChatroomConfig, agentId: string): void {
+  const regPath = path.join(chatroomRoot(cfg), "registry", `${agentId}.json`);
+  const info = readJson(regPath);
+  if (!info) return;
+  if (info.cooldown_until || info.cooldown_reason) {
+    info.cooldown_until = null;
+    info.cooldown_reason = null;
+    if (info.status === "waiting") {
+      info.status = "idle";
+    }
+    writeJson(regPath, info);
+  }
+}
+
+// ============================================================================
+// Usage extraction from reply text
+// ============================================================================
+
+const USAGE_LINE_RE = /Usage:\s*([\d,.]+[kKmM]?)\s*in\s*\/\s*([\d,.]+[kKmM]?)\s*out/;
+
+function parseTokenCount(raw: string): number {
+  const cleaned = raw.replace(/,/g, "");
+  const multiplier = /[kK]$/.test(cleaned) ? 1000 : /[mM]$/.test(cleaned) ? 1_000_000 : 1;
+  return Math.round(parseFloat(cleaned.replace(/[kKmM]$/, "")) * multiplier);
+}
+
+function extractUsageFromText(
+  text: string,
+): { input: number; output: number; total: number } | null {
+  const m = text.match(USAGE_LINE_RE);
+  if (!m) return null;
+  const input = parseTokenCount(m[1]);
+  const output = parseTokenCount(m[2]);
+  return { input, output, total: input + output };
 }
 
 // ============================================================================
@@ -3072,6 +3148,26 @@ function classifyError(text: string): TaskErrorType {
     }
   }
   return "LLM_ERROR";
+}
+
+const RETRY_AFTER_PATTERNS = [
+  /retryDelay["']?\s*:\s*["']?(\d+(?:\.\d+)?)\s*s?/i,
+  /retry.?after["']?\s*:\s*["']?(\d+(?:\.\d+)?)/i,
+  /retry in (\d+(?:\.\d+)?)\s*s/i,
+  /Please retry in (\d+(?:\.\d+)?)\s*s/i,
+];
+
+/**
+ * Extract the provider-suggested retry delay (in seconds) from an error message.
+ * Handles formats like `"retryDelay": "57s"`, `retry_after: 31`,
+ * and `"Please retry in 57.944551459s"`.
+ */
+function extractRetryAfterSeconds(errorText: string): number | null {
+  for (const re of RETRY_AFTER_PATTERNS) {
+    const m = errorText.match(re);
+    if (m) return Math.ceil(parseFloat(m[1]));
+  }
+  return null;
 }
 
 /** True for transient LLM output errors (e.g. truncated JSON) where one retry may succeed. */
@@ -3452,6 +3548,7 @@ async function monitorParkedTasks(
         status: "PROCESSING",
         current_phase: "resuming_from_park",
         parked_at: null,
+        started_at: nowISO(),
       } as Partial<TaskRecord>);
 
       // Check if this task has a plan — if so, resume the parked step within the plan
@@ -4145,8 +4242,6 @@ function handleQuestionAnswer(cfg: ChatroomConfig, msg: InboxMessage, logger: Lo
 // ACK timeout monitoring
 // ============================================================================
 
-const RATE_LIMIT_RETRY_DELAY_MS = 60_000;
-
 async function monitorPendingTasks(cfg: ChatroomConfig, logger: Logger): Promise<void> {
   const _terminalStatuses = new Set(["DONE", "FAILED", "ABANDONED", "CANCELLED"]);
   const pending = await listTasksByStatusAsync(cfg, "DISPATCHED", "TIMEOUT", "RETRYING");
@@ -4162,14 +4257,17 @@ async function monitorPendingTasks(cfg: ChatroomConfig, logger: Logger): Promise
       continue;
     }
 
-    // RETRYING tasks wait for the backoff period, then re-dispatch
+    // RETRYING tasks wait for the provider-suggested or default backoff, then re-dispatch
     if (fresh.status === "RETRYING") {
+      const retryAfter = extractRetryAfterSeconds(fresh.error_detail ?? "");
+      const delayMs = Math.max((retryAfter ?? 60) * 1000, 30_000);
       const completedAt = new Date(fresh.completed_at ?? fresh.dispatched_at).getTime();
-      if (now - completedAt < RATE_LIMIT_RETRY_DELAY_MS) continue;
+      if (now - completedAt < delayMs) continue;
 
       if (fresh.retries >= fresh.max_retries) {
         updateTaskRecord(cfg, fresh.task_id, { status: "ABANDONED", completed_at: nowISO() });
         await resetAgentStatusAsync(cfg, fresh.to, logger);
+        invalidateChatroomContextForChannel(fresh.channel_id);
         sendMessageToNAS(
           cfg,
           fresh.channel_id,
@@ -4192,6 +4290,8 @@ async function monitorPendingTasks(cfg: ChatroomConfig, logger: Logger): Promise
         completed_at: null,
         current_phase: "retrying",
       } as Partial<TaskRecord>);
+      clearAgentCooldown(cfg, fresh.to);
+      invalidateChatroomContextForChannel(fresh.channel_id);
 
       const root = chatroomRoot(cfg);
       const inboxDir = path.join(root, "inbox", fresh.to);
@@ -4220,6 +4320,7 @@ async function monitorPendingTasks(cfg: ChatroomConfig, logger: Logger): Promise
       if (fresh.retries >= fresh.max_retries) {
         updateTaskRecord(cfg, fresh.task_id, { status: "ABANDONED" });
         await resetAgentStatusAsync(cfg, fresh.to, logger);
+        invalidateChatroomContextForChannel(fresh.channel_id);
         sendMessageToNAS(
           cfg,
           fresh.channel_id,
@@ -4234,6 +4335,7 @@ async function monitorPendingTasks(cfg: ChatroomConfig, logger: Logger): Promise
           retries: fresh.retries + 1,
           dispatched_at: nowISO(),
         });
+        invalidateChatroomContextForChannel(fresh.channel_id);
         const root = chatroomRoot(cfg);
         const inboxDir = path.join(root, "inbox", fresh.to);
         ensureDir(inboxDir);
@@ -4272,6 +4374,7 @@ async function monitorPendingTasks(cfg: ChatroomConfig, logger: Logger): Promise
         current_phase: "timed_out",
       } as Partial<TaskRecord>);
       await resetAgentStatusAsync(cfg, task.to, logger);
+      invalidateChatroomContextForChannel(task.channel_id);
       sendMessageToNAS(
         cfg,
         task.channel_id,
@@ -4290,35 +4393,85 @@ async function monitorPendingTasks(cfg: ChatroomConfig, logger: Logger): Promise
     if (!task.error_type) continue;
 
     if (task.error_type === "RATE_LIMITED") {
-      // Auto-retry: transition to RETRYING, the next monitor cycle will re-dispatch after delay
-      logger.info(`Task ${task.task_id} failed with RATE_LIMITED — scheduling auto-retry`);
+      const retryAfter = extractRetryAfterSeconds(task.error_detail ?? "");
+      const delaySec = Math.max(retryAfter ?? 60, 30);
+      logger.info(
+        `Task ${task.task_id} failed with RATE_LIMITED — scheduling auto-retry in ${delaySec}s`,
+      );
       updateTaskRecord(cfg, task.task_id, {
         status: "RETRYING",
         current_phase: "waiting_rate_limit",
+        // Keep error_detail so the RETRYING branch can read the dynamic delay
       } as Partial<TaskRecord>);
+      const cooldownUntil = new Date(Date.now() + delaySec * 1000).toISOString();
+      setAgentCooldown(cfg, task.to, cooldownUntil, "rate_limit");
+      sendMessageToNAS(
+        cfg,
+        task.channel_id,
+        `[RATE_LIMIT] Waiting ${delaySec}s before retry (${task.retries + 1}/${task.max_retries}) — ${task.to}`,
+        "STATUS_UPDATE",
+        [],
+        undefined,
+        { error_type: "RATE_LIMITED", retry_after_seconds: delaySec, task_id: task.task_id },
+      );
       continue;
     }
 
     if (task.error_type === "CONTEXT_OVERFLOW") {
-      // Notify orchestrator via system message so it can decide (simplify & re-dispatch or abort)
+      const ctxRetries = task.context_retries ?? 0;
+      const maxCtxRetries = task.max_context_retries ?? 2;
+
+      if (ctxRetries < maxCtxRetries) {
+        // The embedded runner already attempted compaction + tool result truncation
+        // and reset the session. Re-dispatch so the worker starts fresh.
+        logger.info(
+          `Task ${task.task_id} CONTEXT_OVERFLOW — auto-retry ${ctxRetries + 1}/${maxCtxRetries}`,
+        );
+        updateTaskRecord(cfg, task.task_id, {
+          status: "RETRYING",
+          current_phase: "context_overflow_recovery",
+          context_retries: ctxRetries + 1,
+        } as Partial<TaskRecord>);
+        invalidateChatroomContextForChannel(task.channel_id);
+        sendMessageToNAS(
+          cfg,
+          task.channel_id,
+          `[CONTEXT_OVERFLOW] Session reset — retrying (${ctxRetries + 1}/${maxCtxRetries}) — ${task.to}`,
+          "STATUS_UPDATE",
+          [],
+          undefined,
+          { error_type: "CONTEXT_OVERFLOW", task_id: task.task_id },
+        );
+        continue;
+      }
+
+      // Retries exhausted — notify orchestrator
       const sysMsg =
-        `[SYSTEM] Task ${task.task_id} failed: CONTEXT_OVERFLOW.\n` +
+        `[SYSTEM] Task ${task.task_id} failed: CONTEXT_OVERFLOW after ${maxCtxRetries} recovery attempts.\n` +
         `Target: ${task.to} | Instruction: "${task.instruction.slice(0, 100)}"\n` +
         `The instruction may be too complex for the agent's context window.\n` +
         `Options: simplify the instruction and re-dispatch, or cancel the task.`;
-      sendMessageToNAS(cfg, "general", sysMsg, "SYSTEM", [cfg.agentId]);
-      // Clear error_type so we don't notify repeatedly
+      sendMessageToNAS(cfg, "general", sysMsg, "SYSTEM", [cfg.agentId], undefined, {
+        error_type: "CONTEXT_OVERFLOW",
+        task_id: task.task_id,
+      });
       updateTaskRecord(cfg, task.task_id, { error_type: null } as Partial<TaskRecord>);
-      logger.info(`Task ${task.task_id} CONTEXT_OVERFLOW — notified orchestrator in #general`);
+      logger.info(
+        `Task ${task.task_id} CONTEXT_OVERFLOW — retries exhausted, notified orchestrator`,
+      );
       continue;
     }
 
     // LLM_ERROR / TOOL_ERROR: notify orchestrator once
+    const errType = task.error_type;
     const sysMsg =
-      `[SYSTEM] Task ${task.task_id} failed: ${task.error_type}.\n` +
+      `[SYSTEM] Task ${task.task_id} failed: ${errType}.\n` +
       `Target: ${task.to} | Error: ${(task.error_detail ?? "unknown").slice(0, 200)}\n` +
       `Review the error and decide whether to re-dispatch or cancel.`;
-    sendMessageToNAS(cfg, "general", sysMsg, "SYSTEM", [cfg.agentId]);
+    sendMessageToNAS(cfg, "general", sysMsg, "SYSTEM", [cfg.agentId], undefined, {
+      error_type: errType,
+      task_id: task.task_id,
+    });
     updateTaskRecord(cfg, task.task_id, { error_type: null } as Partial<TaskRecord>);
     logger.info(`Task ${task.task_id} ${task.error_type} — notified orchestrator in #general`);
   }
@@ -4633,6 +4786,88 @@ async function buildChatroomContext(
 }
 
 // ============================================================================
+// Chatroom context injection tracking — first message gets full context,
+// subsequent messages get only dynamic state (active tasks, channel, etc.)
+// ============================================================================
+
+const _chatroomContextInjected = new Map<string, boolean>();
+
+/**
+ * Invalidate the "full context already sent" flag for a specific DM channel so
+ * the next message to that session re-injects the complete chatroom context
+ * (agent list, protocol rules, etc.) instead of only the delta.
+ *
+ * Call this whenever a session is likely to have been reset or compacted
+ * (e.g. task re-dispatch after CONTEXT_OVERFLOW, or terminal state cleanup).
+ */
+function invalidateChatroomContextForChannel(channelId: string): void {
+  for (const key of _chatroomContextInjected.keys()) {
+    if (key.includes(channelId)) {
+      _chatroomContextInjected.delete(key);
+    }
+  }
+}
+
+async function buildOrchestratorContextDelta(
+  cfg: ChatroomConfig,
+  sourceChannel?: string,
+  currentMessageHumanApproval?: boolean,
+): Promise<string> {
+  const lines: string[] = [
+    `[Chatroom State Update]`,
+    sourceChannel ? `Current channel: #${sourceChannel}` : ``,
+  ];
+
+  if (currentMessageHumanApproval === true) {
+    lines.push(`[CURRENT MESSAGE] Sent WITH /human — human_approval_required: true is allowed.`);
+  } else {
+    lines.push(
+      `[CURRENT MESSAGE] Sent WITHOUT /human — do NOT pass human_approval_required: true.`,
+    );
+  }
+
+  const activeTasks = await listTasksByStatusAsync(
+    cfg,
+    "DISPATCHED",
+    "ACKED",
+    "PROCESSING",
+    "RETRYING",
+    "PARKED",
+  );
+  if (activeTasks.length > 0) {
+    lines.push(``, `Active Tasks:`);
+    for (const t of activeTasks) {
+      const phase = t.current_phase ? ` (${t.current_phase})` : "";
+      const errInfo = t.error_type ? ` [ERROR: ${t.error_type}]` : "";
+      const stepInfo =
+        t.current_step != null && t.total_steps != null
+          ? ` [${t.current_step}/${t.total_steps}]`
+          : "";
+      lines.push(
+        `  - [${t.status}${phase}${stepInfo}${errInfo}] ${t.task_id.slice(0, 8)}... → ${t.to}: "${t.instruction.slice(0, 60)}"`,
+      );
+    }
+  }
+
+  return lines.filter(Boolean).join("\n");
+}
+
+function buildWorkerContextDelta(_cfg: ChatroomConfig, sourceChannel?: string): string {
+  return sourceChannel ? `[Chatroom State Update] Current channel: #${sourceChannel}` : "";
+}
+
+async function buildChatroomContextDelta(
+  cfg: ChatroomConfig,
+  sourceChannel?: string,
+  currentMessageHumanApproval?: boolean,
+): Promise<string> {
+  if (cfg.role === "orchestrator") {
+    return buildOrchestratorContextDelta(cfg, sourceChannel, currentMessageHumanApproval);
+  }
+  return buildWorkerContextDelta(cfg, sourceChannel);
+}
+
+// ============================================================================
 // Auto-dispatch: push messages through the LLM processing chain
 // ============================================================================
 
@@ -4669,11 +4904,30 @@ async function autoDispatchMessage(
       : msg.from;
 
     const currentMessageHumanApproval = msg.metadata?.human_approval_required === true;
-    const chatroomContext = await buildChatroomContext(
-      chatroomCfg,
-      channelId,
-      currentMessageHumanApproval,
-    );
+    const isFirstContextInSession = !_chatroomContextInjected.get(route.sessionKey);
+    const chatroomContext = isFirstContextInSession
+      ? await buildChatroomContext(chatroomCfg, channelId, currentMessageHumanApproval)
+      : await buildChatroomContextDelta(chatroomCfg, channelId, currentMessageHumanApproval);
+    if (isFirstContextInSession) {
+      _chatroomContextInjected.set(route.sessionKey, true);
+    }
+
+    if (chatroomContext) {
+      sendMessageToNAS(
+        chatroomCfg,
+        channelId,
+        `[CONTEXT_INJECTED] ${isFirstContextInSession ? "Full" : "Delta"} context (${chatroomContext.length} chars)`,
+        "STATUS_UPDATE",
+        [],
+        undefined,
+        {
+          context_snapshot: chatroomContext.slice(0, 5000),
+          context_type: isFirstContextInSession ? "full" : "delta",
+          context_chars: chatroomContext.length,
+          session_key: route.sessionKey,
+        },
+      );
+    }
 
     // If this is a RESULT_REPORT to the orchestrator, add a review prompt
     let messageBody: string;
@@ -5889,6 +6143,8 @@ async function autoDispatchForTask(
       if (taskCompleted) return;
       taskCompleted = true;
 
+      const usage = extractUsageFromText(text);
+
       try {
         if (payload.isError) {
           const errType = classifyError(text);
@@ -5901,7 +6157,7 @@ async function autoDispatchForTask(
               note: "Legacy task run (no plan).",
             },
           } as Partial<TaskRecord>);
-          await sendTaskResult(chatroomCfg, taskId, text, "FAILED", logger, [], errType);
+          await sendTaskResult(chatroomCfg, taskId, text, "FAILED", logger, [], errType, usage);
           return;
         }
 
@@ -5913,7 +6169,16 @@ async function autoDispatchForTask(
           },
         } as Partial<TaskRecord>);
         const producedFiles = scanOutputDir(outputDir as string);
-        await sendTaskResult(chatroomCfg, taskId, text, "DONE", logger, producedFiles);
+        await sendTaskResult(
+          chatroomCfg,
+          taskId,
+          text,
+          "DONE",
+          logger,
+          producedFiles,
+          undefined,
+          usage,
+        );
       } catch (err) {
         logger.error(`Failed to send task result for ${taskId}: ${err}`);
       }
