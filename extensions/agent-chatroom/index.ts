@@ -8747,6 +8747,14 @@ const agentChatroomPlugin = {
                       `[question] Answer received for task ${msg.metadata?.source_task_id}: ${msg.content.text.slice(0, 100)}`,
                     );
                     break;
+                  case "STATUS_UPDATE":
+                  case "BARRIER_SIGNAL":
+                  case "PERMISSION_REQUEST":
+                  case "PERMISSION_RESPONSE":
+                  case "PLAN_APPROVED":
+                  case "PLAN_REJECTED":
+                  case "SYSTEM":
+                    break;
                   default:
                     await autoDispatchMessage(cfg, msg, runtime, config, logger);
                     break;
