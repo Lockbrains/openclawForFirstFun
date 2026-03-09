@@ -255,6 +255,9 @@ interface ParkedTaskInfo {
     url?: string;
     expected_status?: number;
     permission_id?: string;
+    working_dir?: string;
+    body_contains?: string;
+    body_regex?: string;
   };
   poll_interval_ms: number;
   max_wait_ms: number;
@@ -615,6 +618,7 @@ function isChatroomUri(s: string): boolean {
  *   → "chatroom://assets/art/task/file.png"
  */
 function toChatroomUri(absPath: string, cfg: ChatroomConfig): string {
+  if (isChatroomUri(absPath)) return absPath;
   const rel = toNasRelativePath(cfg, absPath);
   // Strip leading "chatroom/" if present since the URI scheme already implies it
   const stripped = rel.startsWith("chatroom/") ? rel.slice("chatroom/".length) : rel;
@@ -3358,41 +3362,88 @@ function checkParkCondition(
         const command = info.watch_config.command;
         if (!command) return { met: false, result: "No command configured" };
         const { execSync } = require("child_process");
+        const cwd = info.watch_config.working_dir || undefined;
         try {
           const output = execSync(command, {
             timeout: 30_000,
             encoding: "utf-8",
+            cwd,
             stdio: ["pipe", "pipe", "pipe"],
           });
           return { met: true, result: `Command succeeded:\n${(output as string).slice(0, 2000)}` };
         } catch (err: any) {
+          const stderr = err.stderr?.toString?.() ?? "";
+          const stdout = err.stdout?.toString?.() ?? "";
+          const detail = stderr || stdout || err.message || "";
           return {
             met: false,
-            result: `Command still failing: exit ${err.status ?? "unknown"}`,
+            result: `Command failed (exit ${err.status ?? "unknown"}): ${detail.slice(0, 500)}`,
           };
         }
       }
       case "poll_url": {
-        // Synchronous HTTP check via child_process curl
         const url = info.watch_config.url;
         if (!url) return { met: false, result: "No url configured" };
         const expectedStatus = info.watch_config.expected_status ?? 200;
+        const bodyContains = info.watch_config.body_contains;
+        const bodyRegex = info.watch_config.body_regex;
+        const needBody = !!(bodyContains || bodyRegex);
         const { execSync } = require("child_process");
         try {
-          const output = execSync(
-            `curl -s -o /dev/null -w "%{http_code}" --max-time 10 ${JSON.stringify(url)}`,
-            { encoding: "utf-8", timeout: 15_000, stdio: ["pipe", "pipe", "pipe"] },
-          );
-          const statusCode = parseInt((output as string).trim(), 10);
-          if (statusCode === expectedStatus) {
-            return { met: true, result: `URL returned ${statusCode} (expected ${expectedStatus})` };
+          // When body matching is needed, capture both status code and body
+          const curlCmd = needBody
+            ? `curl -s -w "\n%{http_code}" --max-time 10 ${JSON.stringify(url)}`
+            : `curl -s -o /dev/null -w "%{http_code}" --max-time 10 ${JSON.stringify(url)}`;
+          const raw = execSync(curlCmd, {
+            encoding: "utf-8",
+            timeout: 15_000,
+            stdio: ["pipe", "pipe", "pipe"],
+          }) as string;
+
+          let statusCode: number;
+          let body = "";
+          if (needBody) {
+            const lastNewline = raw.lastIndexOf("\n");
+            body = lastNewline > 0 ? raw.slice(0, lastNewline) : "";
+            statusCode = parseInt(raw.slice(lastNewline + 1).trim(), 10);
+          } else {
+            statusCode = parseInt(raw.trim(), 10);
           }
+
+          if (statusCode !== expectedStatus) {
+            return {
+              met: false,
+              result: `URL returned ${statusCode}, waiting for ${expectedStatus}`,
+            };
+          }
+
+          if (bodyContains && !body.includes(bodyContains)) {
+            return {
+              met: false,
+              result: `URL ${statusCode} OK but body missing "${bodyContains.slice(0, 80)}" (body ${body.length} bytes)`,
+            };
+          }
+          if (bodyRegex) {
+            try {
+              if (!new RegExp(bodyRegex).test(body)) {
+                return {
+                  met: false,
+                  result: `URL ${statusCode} OK but body doesn't match regex /${bodyRegex.slice(0, 80)}/ (body ${body.length} bytes)`,
+                };
+              }
+            } catch (regexErr) {
+              return { met: false, result: `Invalid body_regex: ${regexErr}` };
+            }
+          }
+
+          const snippet = needBody ? ` body: ${body.slice(0, 300)}` : "";
+          return { met: true, result: `URL returned ${statusCode}${snippet}` };
+        } catch (err: any) {
+          const stderr = err.stderr?.toString?.() ?? "";
           return {
             met: false,
-            result: `URL returned ${statusCode}, waiting for ${expectedStatus}`,
+            result: `URL unreachable: ${(stderr || err.message || "").slice(0, 300)}`,
           };
-        } catch {
-          return { met: false, result: `URL unreachable` };
         }
       }
       case "permission": {
@@ -7925,14 +7976,27 @@ const agentChatroomPlugin = {
           "IMPORTANT: After calling this tool, your response will be your FINAL output.\n" +
           "Put all continuation logic in resume_prompt.\n\n" +
           "Watch types:\n" +
-          '  - "shell": Run a command; condition met when it exits 0\n' +
+          '  - "shell": Run a command; condition met when it exits 0. Use working_dir for correct cwd.\n' +
           '  - "file": Wait for a file to appear at a path\n' +
-          '  - "poll_url": Poll a URL; condition met when it returns expected status code\n\n' +
-          "Example:\n" +
-          '  chatroom_task_park(task_id="abc", watch_type="shell",\n' +
-          '    command="test -f /output/build.zip && echo done",\n' +
-          '    resume_prompt="Build finished. Upload build.zip to NAS and report.",\n' +
-          "    poll_interval_ms=30000, max_wait_minutes=30)",
+          '  - "poll_url": Poll a URL; condition met when expected status + optional body_contains/body_regex match\n\n' +
+          "Examples:\n" +
+          "  File watch:\n" +
+          '    chatroom_task_park(task_id="abc", watch_type="file",\n' +
+          '      file_path="/output/build.zip",\n' +
+          '      resume_prompt="Build finished. Upload build.zip to NAS and report.",\n' +
+          "      poll_interval_ms=30000, max_wait_minutes=30)\n\n" +
+          "  Shell (Jenkins build check via CLI — RECOMMENDED for CI/CD):\n" +
+          '    chatroom_task_park(task_id="abc", watch_type="shell",\n' +
+          '      command="python3 /path/to/cli.py -c /path/to/config.yaml build check -p ios -m release --after 42",\n' +
+          '      working_dir="/path/to/agent",\n' +
+          '      resume_prompt="Build finished. Validate artifacts and upload.",\n' +
+          "      poll_interval_ms=30000, max_wait_minutes=60)\n\n" +
+          "  URL with body matching (e.g. Jenkins JSON API):\n" +
+          '    chatroom_task_park(task_id="abc", watch_type="poll_url",\n' +
+          '      url="http://jenkins:8080/job/Pipeline/42/api/json",\n' +
+          '      body_contains=\'"result":"SUCCESS"\',\n' +
+          '      resume_prompt="Build succeeded. Continue with upload.",\n' +
+          "      poll_interval_ms=30000, max_wait_minutes=60)",
         parameters: Type.Object({
           task_id: Type.String({ description: "The task ID being parked" }),
           watch_type: Type.String({
@@ -7956,6 +8020,26 @@ const agentChatroomPlugin = {
           expected_status: Type.Optional(
             Type.Number({
               description: 'For watch_type="poll_url": expected HTTP status (default 200)',
+            }),
+          ),
+          body_contains: Type.Optional(
+            Type.String({
+              description:
+                'For watch_type="poll_url": condition met only when response body contains this string. ' +
+                'Useful for checking JSON API responses (e.g. \'"result":"SUCCESS"\')',
+            }),
+          ),
+          body_regex: Type.Optional(
+            Type.String({
+              description:
+                'For watch_type="poll_url": condition met only when response body matches this regex pattern',
+            }),
+          ),
+          working_dir: Type.Optional(
+            Type.String({
+              description:
+                'For watch_type="shell": working directory for command execution. ' +
+                "Use absolute path to ensure the command can find config files and dependencies.",
             }),
           ),
           resume_prompt: Type.String({
@@ -7983,6 +8067,9 @@ const agentChatroomPlugin = {
               file_path?: string;
               url?: string;
               expected_status?: number;
+              body_contains?: string;
+              body_regex?: string;
+              working_dir?: string;
               resume_prompt: string;
               poll_interval_ms?: number;
               max_wait_minutes?: number;
@@ -8024,6 +8111,9 @@ const agentChatroomPlugin = {
                 file_path: p.file_path,
                 url: p.url,
                 expected_status: p.expected_status,
+                body_contains: p.body_contains,
+                body_regex: p.body_regex,
+                working_dir: p.working_dir,
               },
               poll_interval_ms: pollInterval,
               max_wait_ms: maxWaitMinutes * 60_000,
