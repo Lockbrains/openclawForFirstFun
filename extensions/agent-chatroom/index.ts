@@ -4912,7 +4912,7 @@ async function autoDispatchMessage(
       _chatroomContextInjected.set(route.sessionKey, true);
     }
 
-    if (chatroomContext) {
+    if (chatroomContext && isDM) {
       sendMessageToNAS(
         chatroomCfg,
         channelId,
